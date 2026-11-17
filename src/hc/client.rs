@@ -755,6 +755,14 @@ pub fn global_core() -> Option<Arc<Core>> {
         .clone()
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HcMachineInfo {
+    pub name: String,
+    pub target: Option<String>,
+    pub host: Option<String>,
+    pub connected: bool,
+}
+
 #[derive(Default)]
 struct HcRegistry {
     pane_to_addr: HashMap<PaneId, String>,
@@ -763,12 +771,16 @@ struct HcRegistry {
     pending_labels: HashMap<PaneId, Value>,
     pending_machine: HashMap<PaneId, String>,
     default_spawn_machine: Option<String>,
+    configured_machines: Vec<HcMachineInfo>,
     ws_to_space_id: HashMap<String, String>,
     ws_to_machine: HashMap<String, String>,
     ws_to_raw_name: HashMap<String, String>,
     tab_to_shared_id: HashMap<(String, usize), String>,
     pane_to_shared_id: HashMap<PaneId, String>,
     doc_versions_by_machine: HashMap<Option<String>, u64>,
+    last_written_versions_by_machine: HashMap<Option<String>, u64>,
+    known_space_ids_by_machine: HashMap<Option<String>, HashSet<String>>,
+    known_tab_ids_by_machine: HashMap<Option<String>, HashSet<String>>,
 }
 
 static REGISTRY: OnceLock<Mutex<HcRegistry>> = OnceLock::new();
@@ -913,10 +925,6 @@ pub fn set_local_doc_version(version: u64) {
     set_machine_doc_version(None, version);
 }
 
-pub fn local_doc_version() -> u64 {
-    machine_doc_version(None)
-}
-
 pub fn set_machine_doc_version(machine: Option<&str>, version: u64) {
     registry()
         .lock()
@@ -982,6 +990,8 @@ pub fn queue_pending_machine_for_pane(pane_id: PaneId, machine: String) {
         .insert(pane_id, machine);
 }
 
+pub const HC_MACHINE_ENV: &str = "HERDR_HC_MACHINE";
+
 pub fn take_pending_machine_for_pane(pane_id: PaneId) -> Option<String> {
     registry()
         .lock()
@@ -1003,6 +1013,84 @@ pub fn default_spawn_machine() -> Option<String> {
         .unwrap_or_else(|p| p.into_inner())
         .default_spawn_machine
         .clone()
+}
+
+pub fn set_configured_machines(machines: Vec<HcMachineInfo>) {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .configured_machines = machines;
+}
+
+pub fn configured_machines() -> Vec<HcMachineInfo> {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .configured_machines
+        .clone()
+}
+
+pub fn set_last_written_version(machine: Option<&str>, version: u64) {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .last_written_versions_by_machine
+        .insert(machine.map(str::to_owned), version);
+}
+
+pub fn last_written_version(machine: Option<&str>) -> u64 {
+    let key = machine.map(str::to_owned);
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .last_written_versions_by_machine
+        .get(&key)
+        .copied()
+        .unwrap_or(0)
+}
+
+pub fn set_known_doc_ids(
+    machine: Option<&str>,
+    space_ids: HashSet<String>,
+    tab_ids: HashSet<String>,
+) {
+    let key = machine.map(str::to_owned);
+    let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    reg.known_space_ids_by_machine
+        .insert(key.clone(), space_ids);
+    reg.known_tab_ids_by_machine.insert(key, tab_ids);
+}
+
+pub fn is_known_space_id(machine: Option<&str>, space_id: &str) -> bool {
+    let key = machine.map(str::to_owned);
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .known_space_ids_by_machine
+        .get(&key)
+        .is_some_and(|set| set.contains(space_id))
+}
+
+pub fn is_known_tab_id(machine: Option<&str>, tab_id: &str) -> bool {
+    let key = machine.map(str::to_owned);
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .known_tab_ids_by_machine
+        .get(&key)
+        .is_some_and(|set| set.contains(tab_id))
+}
+
+pub fn tracked_doc_machines() -> Vec<Option<String>> {
+    let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    let mut out = HashSet::new();
+    for key in reg.known_space_ids_by_machine.keys() {
+        out.insert(key.clone());
+    }
+    for key in reg.doc_versions_by_machine.keys() {
+        out.insert(key.clone());
+    }
+    out.into_iter().collect()
 }
 
 #[cfg(test)]

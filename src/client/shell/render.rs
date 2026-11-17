@@ -1,5 +1,7 @@
 use super::*;
 
+#[path = "../shell/hc_sidebar.rs"]
+pub(in crate::client::shell) mod hc_sidebar;
 #[path = "../shell/overlays.rs"]
 mod overlays;
 #[path = "../shell/sidebar.rs"]
@@ -236,6 +238,8 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) collapsed_endpoints: &'a HashSet<ClientEndpointId>,
     pub(super) collapsed_groups: &'a HashSet<String>,
     pub(super) remote_collapsed_groups: &'a HashMap<ClientEndpointId, HashSet<String>>,
+    pub(super) collapsed_hc_machines: &'a HashSet<Option<String>>,
+    pub(super) selected_hc_machine: Option<&'a Option<String>>,
     pub(super) workspace_scroll: &'a mut usize,
     pub(super) agent_scroll: &'a mut usize,
     pub(super) tab_scroll: &'a mut usize,
@@ -329,6 +333,7 @@ pub(super) fn render_shell(
         hits.agent_sort_toggle = Rect::default();
         hits.new_workspace = Rect::default();
         hits.machines.clear();
+        hits.hc_machines.clear();
         hits.workspaces.clear();
         hits.agents.clear();
         hits.endpoint_agents.clear();

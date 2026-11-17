@@ -84,6 +84,7 @@ pub(super) fn snapshot_with_completions(
                 number: workspace.number,
                 label: workspace.label,
                 custom_label: state.custom_name.is_some(),
+                machine: crate::hc::client::get_workspace_machine(&state.id),
                 branch: state.branch(),
                 git_ahead_behind: state.git_ahead_behind(),
                 tokens,
@@ -239,6 +240,15 @@ pub(super) fn snapshot_with_completions(
                 preview: notes.preview,
             });
 
+    let hc_machines = crate::hc::client::configured_machines()
+        .into_iter()
+        .map(|machine| protocol::ClientShellHcMachine {
+            name: machine.name,
+            target: machine.target,
+            connected: machine.connected,
+        })
+        .collect();
+
     let shell = protocol::ClientShellSnapshot {
         boot_id: boot_id.to_owned(),
         revision,
@@ -258,6 +268,7 @@ pub(super) fn snapshot_with_completions(
         tab_bar_right_separator: app.state.tab_bar_right_separator.clone(),
         agent_view_label,
         agent_order,
+        hc_machines,
         workspaces,
         tabs,
         panes,

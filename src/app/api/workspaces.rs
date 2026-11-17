@@ -55,20 +55,48 @@ impl App {
                 None => self.workspace_creation_source(),
             }
         };
-        let cwd = params.cwd.map(PathBuf::from).unwrap_or_else(|| {
-            source_workspace_index.map_or_else(
-                || self.resolve_new_terminal_cwd(None),
-                |index| self.resolved_new_workspace_cwd_from(index),
-            )
-        });
-        let extra_env = match super::env::normalize_launch_env(params.env) {
+        let mut extra_env = match super::env::normalize_launch_env(params.env) {
             Ok(env) => env,
             Err((code, message)) => return encode_error(id, &code, message),
         };
-        match self.create_workspace_with_launch_env(cwd, params.focus, extra_env) {
+        let explicit_machine =
+            Self::extract_env_var(&mut extra_env, crate::hc::client::HC_MACHINE_ENV);
+        let source_machine = source_workspace_index
+            .and_then(|index| self.state.workspaces.get(index))
+            .and_then(|workspace| crate::hc::client::get_workspace_machine(&workspace.id));
+        let target_machine = match explicit_machine {
+            Some(value) => (!value.trim().is_empty()).then_some(value),
+            None => source_machine.clone(),
+        };
+        let source_matches_machine =
+            source_workspace_index.is_some() && source_machine == target_machine;
+        let cwd = params.cwd.map(PathBuf::from).unwrap_or_else(|| {
+            if source_matches_machine {
+                source_workspace_index.map_or_else(
+                    || self.resolve_new_terminal_cwd(None),
+                    |index| self.resolved_new_workspace_cwd_from(index),
+                )
+            } else if target_machine.is_some() {
+                PathBuf::from("~")
+            } else {
+                self.resolve_new_terminal_cwd(None)
+            }
+        });
+        let hc_active = crate::hc::global_core().is_some();
+        if hc_active {
+            crate::hc::client::set_default_spawn_machine(target_machine.clone());
+        }
+        let created = self.create_workspace_with_launch_env(cwd, params.focus, extra_env);
+        if hc_active {
+            crate::hc::client::set_default_spawn_machine(None);
+        }
+        match created {
             Ok(index) => {
-                if let Some(label) = params.label {
-                    if let Some(workspace) = self.state.workspaces.get_mut(index) {
+                if let Some(workspace) = self.state.workspaces.get_mut(index) {
+                    if hc_active {
+                        crate::hc::client::set_workspace_machine(&workspace.id, target_machine);
+                    }
+                    if let Some(label) = params.label {
                         workspace.set_custom_name(label);
                         crate::logging::workspace_renamed(&workspace.id);
                     }
@@ -82,6 +110,19 @@ impl App {
             }
             Err(err) => encode_error(id, "workspace_create_failed", err.to_string()),
         }
+    }
+
+    fn extract_env_var(extra_env: &mut Vec<(String, String)>, key: &str) -> Option<String> {
+        let mut found = None;
+        extra_env.retain(|(entry_key, value)| {
+            if entry_key == key {
+                found = Some(value.clone());
+                false
+            } else {
+                true
+            }
+        });
+        found
     }
 
     pub(super) fn handle_workspace_focus(&mut self, id: String, target: WorkspaceTarget) -> String {

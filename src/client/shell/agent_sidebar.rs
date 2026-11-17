@@ -295,7 +295,7 @@ pub(super) fn agent_row(
     let rows = crate::ui::sidebar_agent_rows(
         &config.agents,
         crate::ui::AgentTokenContext {
-            machine,
+            machine: machine.or(workspace.machine.as_deref()),
             workspace: &workspace.label,
             tab: tab_label,
             pane: agent

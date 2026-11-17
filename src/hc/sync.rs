@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use ratatui::layout::Direction;
 use serde_json::{json, Value};
@@ -20,11 +21,13 @@ use crate::workspace::{
 };
 
 use super::client::{
-    get_pane_shared_id, get_space_id, get_tab_shared_id, get_workspace_machine,
-    get_workspace_raw_name, is_address_known, local_doc_version, pane_address, pane_for_address,
-    queue_pending_attach_for_pane, queue_pending_machine_for_pane, set_default_spawn_machine,
-    set_local_doc_version, set_machine_doc_version, set_pane_shared_id, set_space_id,
-    set_tab_shared_id, set_workspace_machine, set_workspace_raw_name, Core, EventLines, Stream,
+    configured_machines, get_pane_shared_id, get_space_id, get_tab_shared_id,
+    get_workspace_machine, get_workspace_raw_name, is_address_known, is_known_space_id,
+    is_known_tab_id, last_written_version, pane_address, pane_for_address,
+    queue_pending_attach_for_pane, set_configured_machines, set_known_doc_ids,
+    set_last_written_version, set_local_doc_version, set_machine_doc_version, set_pane_shared_id,
+    set_space_id, set_tab_shared_id, set_workspace_machine, set_workspace_raw_name,
+    tracked_doc_machines, unregister_pane, Core, EventLines, HcMachineInfo, Stream,
 };
 use super::doc::{
     fresh_id, read_doc, write_doc, Document, HcAxis, HcContent, HcKind, HcNode, HcSize,
@@ -33,11 +36,18 @@ use super::doc::{
 
 const DEFAULT_COLS: u16 = 80;
 const DEFAULT_ROWS: u16 = 24;
+const REMOTE_DOC_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 static LABELED_TERMINALS: OnceLock<Mutex<HashMap<String, (String, String)>>> = OnceLock::new();
+static UNRESTORED_OFFLINE_SPACES: OnceLock<Mutex<HashMap<Option<String>, Vec<SharedSpace>>>> =
+    OnceLock::new();
 
 fn labeled_cache() -> &'static Mutex<HashMap<String, (String, String)>> {
     LABELED_TERMINALS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn unrestored_offline_spaces() -> &'static Mutex<HashMap<Option<String>, Vec<SharedSpace>>> {
+    UNRESTORED_OFFLINE_SPACES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn record_terminal_label_cache(address: &str, space_id: &str, tab_id: &str) {
@@ -59,7 +69,7 @@ pub struct RestoredHcSession {
 }
 
 pub struct HcDocSnapshot {
-    spaces: Vec<SharedSpace>,
+    docs_by_machine: HashMap<Option<String>, Document>,
     labels: Vec<(String, String, String)>,
 }
 
@@ -73,6 +83,23 @@ struct AttachContext<'a> {
     events: mpsc::Sender<AppEvent>,
     render_notify: Arc<Notify>,
     render_dirty: Arc<RenderSignal>,
+}
+
+fn app_attach_context<'a>(app: &'a App, shell_config: &'a mut Option<String>) -> AttachContext<'a> {
+    let shell = app.state.default_shell.clone();
+    *shell_config = Some(shell);
+    let default_shell = shell_config.as_deref().unwrap_or("");
+    AttachContext {
+        rows: DEFAULT_ROWS,
+        cols: DEFAULT_COLS,
+        scrollback_limit_bytes: app.state.pane_scrollback_limit_bytes,
+        host_terminal_theme: app.state.host_terminal_theme,
+        host_terminal_appearance: app.pane_host_appearance,
+        shell_config: PaneShellConfig::new(default_shell, app.state.shell_mode),
+        events: app.event_tx.clone(),
+        render_notify: app.render_notify.clone(),
+        render_dirty: app.render_dirty.clone(),
+    }
 }
 
 fn fallback_cwd() -> PathBuf {
@@ -107,6 +134,18 @@ pub(crate) fn qualify_address(machine: Option<&str>, addr: &str) -> String {
     }
 }
 
+pub(crate) fn doc_terminal_address(machine: Option<&str>, full_addr: &str) -> String {
+    let Some(m) = machine.filter(|s| !s.is_empty()) else {
+        return full_addr.to_owned();
+    };
+    full_addr
+        .strip_prefix(m)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .unwrap_or(full_addr)
+        .to_owned()
+}
+
+#[cfg(test)]
 pub(crate) fn format_workspace_display_name(machine: Option<&str>, raw_name: &str) -> String {
     match machine {
         Some(m) if !m.is_empty() => format!("{m} · {raw_name}"),
@@ -143,6 +182,33 @@ fn infer_space_machine(space: &SharedSpace, doc_machine: Option<&str>) -> Option
         }
     }
     None
+}
+
+pub(crate) fn is_space_remote_polluted(space: &SharedSpace) -> Option<String> {
+    if let Some(m) = space
+        .rest
+        .get("machine")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        return Some(m.to_owned());
+    }
+    let mut remote_machine: Option<String> = None;
+    let mut saw_any = false;
+    for tab in &space.tabs {
+        for addr in tab.root.terminal_addresses() {
+            saw_any = true;
+            let m = machine_of_address(&addr)?;
+            if let Some(existing) = remote_machine.as_deref() {
+                if existing != m {
+                    return None;
+                }
+            } else {
+                remote_machine = Some(m.to_owned());
+            }
+        }
+    }
+    saw_any.then(|| remote_machine.unwrap_or_default())
 }
 
 fn terminal_cwd(info: &Value) -> PathBuf {
@@ -391,7 +457,7 @@ fn respawn_hc_pane(
 ) -> io::Result<(PaneId, TerminalState, TerminalRuntime)> {
     let pane_id = PaneId::alloc();
     if let Some(m) = machine {
-        queue_pending_machine_for_pane(pane_id, m.to_owned());
+        super::client::queue_pending_machine_for_pane(pane_id, m.to_owned());
     }
     if let Some(shared_id) = shared_pane_id {
         set_pane_shared_id(pane_id, shared_id.to_owned());
@@ -413,8 +479,10 @@ fn build_workspace_shell(
     let mut next_public_pane_number = 1;
     for tab in &tabs {
         for pane_id in tab.layout.pane_ids() {
-            if !public_pane_numbers.contains_key(&pane_id) {
-                public_pane_numbers.insert(pane_id, next_public_pane_number);
+            if let std::collections::hash_map::Entry::Vacant(entry) =
+                public_pane_numbers.entry(pane_id)
+            {
+                entry.insert(next_public_pane_number);
                 next_public_pane_number += 1;
             }
         }
@@ -487,60 +555,42 @@ fn build_tab_shell(
     })
 }
 
-fn spawn_hc_subscription_task(
-    core: Arc<Core>,
-    sub_channel: u32,
-    mut rx: mpsc::UnboundedReceiver<Stream>,
-    snapshot: Value,
-    events: mpsc::Sender<AppEvent>,
-) {
-    let mut tracker = EventLines::new(&snapshot);
-    tokio::spawn(async move {
-        while let Some(item) = rx.recv().await {
-            match item {
-                Stream::Data(bytes) => {
-                    core.credit(sub_channel, bytes.len());
-                    let pushed = tracker.push(&bytes);
-                    if pushed.docs || pushed.terminals {
-                        let terminals = tracker.all_terminals().to_vec();
-                        if events
-                            .send(AppEvent::HcSync {
-                                docs_changed: pushed.docs,
-                                terminals,
-                            })
-                            .await
-                            .is_err()
-                        {
-                            break;
-                        }
+fn parse_configured_machines(val: &Value) -> Vec<HcMachineInfo> {
+    val.get("machines")
+        .and_then(Value::as_array)
+        .or_else(|| val.as_array())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|m| {
+                    let name = m.get("name").and_then(Value::as_str)?.trim();
+                    if name.is_empty() {
+                        return None;
                     }
-                }
-                Stream::Closed(_) | Stream::Lost => break,
-            }
-        }
-    });
+                    Some(HcMachineInfo {
+                        name: name.to_owned(),
+                        target: m
+                            .get("target")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
+                        host: m
+                            .get("host")
+                            .and_then(Value::as_str)
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_owned),
+                        connected: m.get("state").and_then(Value::as_str) == Some("connected"),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
-static UNRESTORED_OFFLINE_SPACES: OnceLock<Mutex<Vec<SharedSpace>>> = OnceLock::new();
-
-fn unrestored_offline_spaces() -> &'static Mutex<Vec<SharedSpace>> {
-    UNRESTORED_OFFLINE_SPACES.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn collect_configured_machines(core: &Core) -> Vec<String> {
+fn collect_configured_machines_info(core: &Core) -> Vec<HcMachineInfo> {
     match core.list_machines() {
-        Ok(val) => val
-            .get("machines")
-            .and_then(Value::as_array)
-            .or_else(|| val.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|m| m.get("name").and_then(Value::as_str))
-                    .filter(|name| !name.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default(),
+        Ok(val) => parse_configured_machines(&val),
         Err(err) => {
             tracing::warn!(err = %err, "failed listing configured hc machines");
             Vec::new()
@@ -561,17 +611,292 @@ fn collect_initial_terminals(core: &Core, snapshot_terminals: Vec<Value>) -> Vec
             }
         }
     };
-    for entry in snapshot_terminals {
-        push_entry(entry);
-    }
-    if let Ok(list) = core.list_terminals(false) {
+    if let Ok(list) = core.list_terminals(true) {
         if let Some(items) = list.get("terminals").and_then(Value::as_array) {
             for entry in items {
                 push_entry(entry.clone());
             }
         }
     }
+    for entry in snapshot_terminals {
+        push_entry(entry);
+    }
     merged
+}
+
+fn record_known_doc_ids_for_doc(machine: Option<&str>, doc: &Document) {
+    let mut space_ids = HashSet::new();
+    let mut tab_ids = HashSet::new();
+    for space in &doc.spaces {
+        if machine.is_none() && is_space_remote_polluted(space).is_some() {
+            continue;
+        }
+        space_ids.insert(space.id.clone());
+        for tab in &space.tabs {
+            tab_ids.insert(tab.id.clone());
+        }
+    }
+    set_known_doc_ids(machine, space_ids, tab_ids);
+}
+
+type PolledHcDocs = HashMap<Option<String>, (u64, Document)>;
+
+fn poll_hc_state(
+    core: &Core,
+    tracked_machines: &mut Vec<HcMachineInfo>,
+    tracked_docs: &mut PolledHcDocs,
+) -> (Option<Vec<HcMachineInfo>>, Option<PolledHcDocs>) {
+    let next_machines = collect_configured_machines_info(core);
+    let machines_update = if next_machines != *tracked_machines {
+        *tracked_machines = next_machines.clone();
+        Some(next_machines.clone())
+    } else {
+        None
+    };
+
+    let mut target_machines: Vec<Option<String>> = vec![None];
+    for machine in &next_machines {
+        if machine.connected {
+            target_machines.push(Some(machine.name.clone()));
+        }
+    }
+
+    let mut changed_docs = HashMap::new();
+    for machine in target_machines {
+        let Ok((doc, ver)) = read_doc(core, machine.as_deref()) else {
+            continue;
+        };
+        let written_ver = last_written_version(machine.as_deref());
+        let prev = tracked_docs.get(&machine);
+        let unchanged = prev
+            .is_some_and(|(prev_ver, prev_doc)| *prev_ver == ver && prev_doc.spaces == doc.spaces);
+        tracked_docs.insert(machine.clone(), (ver, doc.clone()));
+        if !unchanged && ver != written_ver {
+            changed_docs.insert(machine, (ver, doc));
+        }
+    }
+
+    let docs_update = (!changed_docs.is_empty()).then_some(changed_docs);
+    (machines_update, docs_update)
+}
+
+fn spawn_hc_subscription_task(
+    core: Arc<Core>,
+    sub_channel: u32,
+    mut rx: mpsc::UnboundedReceiver<Stream>,
+    snapshot: Value,
+    initial_machines: Vec<HcMachineInfo>,
+    initial_docs: HashMap<Option<String>, (u64, Document)>,
+    events: mpsc::Sender<AppEvent>,
+) {
+    let mut tracker = EventLines::new(&snapshot);
+    let mut tracked_machines = initial_machines;
+    let mut tracked_docs = initial_docs;
+    tokio::spawn(async move {
+        let mut tick = tokio::time::interval(REMOTE_DOC_POLL_INTERVAL);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let _ = tick.tick().await;
+        let mut last_poll = Instant::now();
+
+        loop {
+            let mut should_poll = false;
+            let mut terminals_changed = false;
+            let mut docs_changed = false;
+
+            tokio::select! {
+                item = rx.recv() => {
+                    match item {
+                        Some(Stream::Data(bytes)) => {
+                            core.credit(sub_channel, bytes.len());
+                            let pushed = tracker.push(&bytes);
+                            docs_changed = pushed.docs;
+                            terminals_changed = pushed.terminals;
+                            if pushed.docs || pushed.terminals {
+                                should_poll = true;
+                            }
+                        }
+                        Some(Stream::Closed(_)) | Some(Stream::Lost) | None => break,
+                    }
+                }
+                _ = tick.tick() => {
+                    if last_poll.elapsed() >= REMOTE_DOC_POLL_INTERVAL {
+                        should_poll = true;
+                    }
+                }
+            }
+
+            if !should_poll && !terminals_changed && !docs_changed {
+                continue;
+            }
+
+            let (machines_update, docs_update) = if should_poll {
+                last_poll = Instant::now();
+                let core_clone = core.clone();
+                let mut m_state = tracked_machines.clone();
+                let mut d_state = tracked_docs.clone();
+                let res = tokio::task::spawn_blocking(move || {
+                    let out = poll_hc_state(&core_clone, &mut m_state, &mut d_state);
+                    (out, m_state, d_state)
+                })
+                .await;
+                match res {
+                    Ok((out, next_m, next_d)) => {
+                        tracked_machines = next_m;
+                        tracked_docs = next_d;
+                        out
+                    }
+                    Err(_) => (None, None),
+                }
+            } else {
+                (None, None)
+            };
+
+            let has_doc_updates = docs_update.is_some();
+            if terminals_changed || docs_changed || machines_update.is_some() || has_doc_updates {
+                let terminals = tracker.all_terminals().to_vec();
+                if events
+                    .send(AppEvent::HcSync {
+                        docs_changed: docs_changed || has_doc_updates,
+                        terminals,
+                        machines: machines_update,
+                        docs_by_machine: docs_update,
+                    })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        }
+    });
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_tabs_from_space(
+    space: &SharedSpace,
+    space_machine: Option<&str>,
+    ctx: &AttachContext<'_>,
+    live_by_addr: &HashMap<&str, &Value>,
+    finished_addrs: &HashSet<&str>,
+    mapped_addresses: &mut HashSet<String>,
+    terminals: &mut HashMap<TerminalId, TerminalState>,
+    terminal_runtimes: &mut HashMap<TerminalId, TerminalRuntime>,
+    allow_respawn_missing: bool,
+) -> (Vec<Tab>, Vec<(usize, String)>, Option<PathBuf>) {
+    let trimmed_folder = space.folder.trim();
+    let mut identity_cwd = (!trimmed_folder.is_empty()).then(|| PathBuf::from(trimmed_folder));
+    let mut tabs = Vec::new();
+    let mut tab_shared_ids = Vec::new();
+
+    for (tab_idx, shared_tab) in space.tabs.iter().enumerate() {
+        let mut pane_pairs = Vec::new();
+        let Some((layout_node, _)) =
+            convert_hc_node_to_layout(&shared_tab.root, &mut |raw_addr, shared_pane_id| {
+                let qualified_addr = qualify_address(space_machine, raw_addr);
+                if mapped_addresses.contains(&qualified_addr) || is_address_known(&qualified_addr) {
+                    return None;
+                }
+                let attach_attempt = if finished_addrs.contains(qualified_addr.as_str()) {
+                    None
+                } else if let Some(info) = live_by_addr.get(qualified_addr.as_str()) {
+                    Some(spawn_hc_attached_pane(ctx, info, Some(shared_pane_id)))
+                } else if allow_respawn_missing {
+                    let synthetic = json!({
+                        "address": qualified_addr,
+                        "cwd": space.folder,
+                    });
+                    Some(spawn_hc_attached_pane(
+                        ctx,
+                        &synthetic,
+                        Some(shared_pane_id),
+                    ))
+                } else {
+                    None
+                };
+
+                let pane_result = match attach_attempt {
+                    Some(Ok(res)) => Ok((res, Some(qualified_addr.clone()))),
+                    _ if allow_respawn_missing => {
+                        let target_cwd = identity_cwd.clone().unwrap_or_else(|| PathBuf::from("~"));
+                        respawn_hc_pane(ctx, target_cwd, space_machine, Some(shared_pane_id))
+                            .map(|res| (res, None))
+                    }
+                    _ => return None,
+                };
+
+                match pane_result {
+                    Ok(((pane_id, term_state, runtime), attached_addr)) => {
+                        if identity_cwd.is_none() {
+                            identity_cwd = Some(term_state.cwd.clone());
+                        }
+                        let term_id = term_state.id.clone();
+                        if let Some(addr) = attached_addr.as_deref() {
+                            mapped_addresses.insert(addr.to_owned());
+                            if let Some(info) = live_by_addr.get(addr) {
+                                if terminal_label_str(info, "herdr.space")
+                                    == Some(space.id.as_str())
+                                    && terminal_label_str(info, "herdr.tab")
+                                        == Some(shared_tab.id.as_str())
+                                {
+                                    record_terminal_label_cache(addr, &space.id, &shared_tab.id);
+                                }
+                            }
+                        }
+                        terminals.insert(term_id.clone(), term_state);
+                        terminal_runtimes.insert(term_id.clone(), runtime);
+                        pane_pairs.push((pane_id, term_id));
+                        Some(pane_id)
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            address = %qualified_addr,
+                            machine = ?space_machine,
+                            err = %err,
+                            "failed restoring hc pane from layout"
+                        );
+                        None
+                    }
+                }
+            })
+        else {
+            continue;
+        };
+
+        let number = tab_idx + 1;
+        let tab_custom_name =
+            (!shared_tab.name.trim().is_empty()).then(|| shared_tab.name.trim().to_owned());
+        if let Some(tab) = build_tab_shell(number, tab_custom_name, layout_node, pane_pairs, ctx) {
+            tab_shared_ids.push((number, shared_tab.id.clone()));
+            tabs.push(tab);
+        }
+    }
+
+    (tabs, tab_shared_ids, identity_cwd)
+}
+
+fn create_workspace_from_shared_space(
+    space: &SharedSpace,
+    space_machine: Option<String>,
+    tabs: Vec<Tab>,
+    tab_shared_ids: Vec<(usize, String)>,
+    identity_cwd: Option<PathBuf>,
+) -> Workspace {
+    let ws_cwd = identity_cwd.unwrap_or_else(fallback_cwd);
+    let fallback_name = fallback_label_from_cwd(&ws_cwd);
+    let raw_name = if !space.name.trim().is_empty() {
+        strip_machine_prefix(space_machine.as_deref(), space.name.trim()).to_owned()
+    } else {
+        fallback_name.clone()
+    };
+    let custom_name = (raw_name != fallback_name).then(|| raw_name.clone());
+    let ws = build_workspace_shell(custom_name, ws_cwd, tabs, 0);
+    set_space_id(&ws.id, space.id.clone());
+    set_workspace_machine(&ws.id, space_machine);
+    set_workspace_raw_name(&ws.id, raw_name);
+    for (number, tab_shared_id) in tab_shared_ids {
+        set_tab_shared_id(&ws.id, number, tab_shared_id);
+    }
+    ws
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -593,9 +918,33 @@ pub fn restore_from_hc(
         .unwrap_or_default();
     let initial_terminals = collect_initial_terminals(core, snapshot_terminals);
 
-    let configured_machines = collect_configured_machines(core);
+    let configured = collect_configured_machines_info(core);
+    set_configured_machines(configured.clone());
+    let connected_set: HashSet<&str> = configured
+        .iter()
+        .filter(|m| m.connected)
+        .map(|m| m.name.as_str())
+        .collect();
 
-    let (local_doc, doc_version) = match read_doc(core, None) {
+    let mut initial_docs: HashMap<Option<String>, (u64, Document)> = HashMap::new();
+    let mut remote_docs_by_machine: HashMap<String, Document> = HashMap::new();
+    let mut seen_space_ids: HashSet<String> = HashSet::new();
+
+    for machine in &configured {
+        if let Ok((remote_doc, remote_ver)) = read_doc(core, Some(&machine.name)) {
+            set_machine_doc_version(Some(&machine.name), remote_ver);
+            record_known_doc_ids_for_doc(Some(&machine.name), &remote_doc);
+            initial_docs.insert(Some(machine.name.clone()), (remote_ver, remote_doc.clone()));
+            for space in &remote_doc.spaces {
+                seen_space_ids.insert(space.id.clone());
+            }
+            if !remote_doc.spaces.is_empty() {
+                remote_docs_by_machine.insert(machine.name.clone(), remote_doc);
+            }
+        }
+    }
+
+    let (local_raw_doc, doc_version) = match read_doc(core, None) {
         Ok(pair) => pair,
         Err(err) => {
             tracing::warn!(err = %err, "failed reading herdr-app doc on startup; starting with empty doc");
@@ -603,24 +952,54 @@ pub fn restore_from_hc(
         }
     };
     set_local_doc_version(doc_version);
+    record_known_doc_ids_for_doc(None, &local_raw_doc);
+    initial_docs.insert(None, (doc_version, local_raw_doc.clone()));
 
-    let mut docs_to_restore: Vec<(Option<String>, Document)> = vec![(None, local_doc)];
-    let mut seen_space_ids: HashSet<String> = docs_to_restore[0]
-        .1
-        .spaces
-        .iter()
-        .map(|space| space.id.clone())
-        .collect();
-    for machine in &configured_machines {
-        if let Ok((mut remote_doc, remote_ver)) = read_doc(core, Some(machine)) {
-            set_machine_doc_version(Some(machine), remote_ver);
-            remote_doc
-                .spaces
-                .retain(|space| seen_space_ids.insert(space.id.clone()));
-            if !remote_doc.spaces.is_empty() {
-                docs_to_restore.push((Some(machine.clone()), remote_doc));
+    let mut local_spaces = Vec::new();
+    let mut local_doc_polluted = false;
+    for space in local_raw_doc.spaces {
+        if let Some(polluted_machine) = is_space_remote_polluted(&space) {
+            local_doc_polluted = true;
+            if let Some(existing_doc) = remote_docs_by_machine.get_mut(&polluted_machine) {
+                if let Some(existing_space) =
+                    existing_doc.spaces.iter_mut().find(|s| s.id == space.id)
+                {
+                    if existing_space.name.trim().is_empty() && !space.name.trim().is_empty() {
+                        existing_space.name =
+                            strip_machine_prefix(Some(&polluted_machine), space.name.trim())
+                                .to_owned();
+                    }
+                    if existing_space.folder.trim().is_empty() && !space.folder.trim().is_empty() {
+                        existing_space.folder = space.folder.clone();
+                    }
+                    continue;
+                }
             }
+            if seen_space_ids.insert(space.id.clone()) {
+                remote_docs_by_machine
+                    .entry(polluted_machine)
+                    .or_default()
+                    .spaces
+                    .push(space);
+            }
+        } else if seen_space_ids.insert(space.id.clone()) {
+            local_spaces.push(space);
         }
+    }
+
+    let mut docs_to_restore: Vec<(Option<String>, Document)> = vec![(
+        None,
+        Document {
+            spaces: local_spaces,
+        },
+    )];
+    for machine in &configured {
+        if let Some(doc) = remote_docs_by_machine.remove(&machine.name) {
+            docs_to_restore.push((Some(machine.name.clone()), doc));
+        }
+    }
+    for (machine, doc) in remote_docs_by_machine {
+        docs_to_restore.push((Some(machine), doc));
     }
 
     let ctx = AttachContext {
@@ -652,146 +1031,55 @@ pub fn restore_from_hc(
     let mut terminals = HashMap::new();
     let mut terminal_runtimes = HashMap::new();
     let mut mapped_addresses = HashSet::new();
-    let mut preserved_offline_spaces = Vec::new();
+    let mut preserved_offline: HashMap<Option<String>, Vec<SharedSpace>> = HashMap::new();
 
     for (doc_machine, doc) in &docs_to_restore {
         for space in &doc.spaces {
             let space_machine = infer_space_machine(space, doc_machine.as_deref());
-            let mut tabs = Vec::new();
-            let mut tab_shared_ids = Vec::new();
-            let trimmed_folder = space.folder.trim();
-            let mut identity_cwd =
-                (!trimmed_folder.is_empty()).then(|| PathBuf::from(trimmed_folder));
-
-            for (tab_idx, shared_tab) in space.tabs.iter().enumerate() {
-                let mut pane_pairs = Vec::new();
-                let Some((layout_node, _)) =
-                    convert_hc_node_to_layout(&shared_tab.root, &mut |raw_addr, shared_pane_id| {
-                        let qualified_addr = qualify_address(space_machine.as_deref(), raw_addr);
-                        if mapped_addresses.contains(&qualified_addr) {
-                            return None;
-                        }
-                        let attach_attempt = if finished_addrs.contains(qualified_addr.as_str()) {
-                            None
-                        } else if let Some(info) = live_by_addr.get(qualified_addr.as_str()) {
-                            Some(spawn_hc_attached_pane(&ctx, info, Some(shared_pane_id)))
-                        } else {
-                            let synthetic = json!({
-                                "address": qualified_addr,
-                                "cwd": space.folder,
-                            });
-                            Some(spawn_hc_attached_pane(
-                                &ctx,
-                                &synthetic,
-                                Some(shared_pane_id),
-                            ))
-                        };
-
-                        let pane_result = match attach_attempt {
-                            Some(Ok(res)) => Ok((res, Some(qualified_addr.clone()), true)),
-                            Some(Err(_)) | None => {
-                                let target_cwd =
-                                    identity_cwd.clone().unwrap_or_else(|| PathBuf::from("~"));
-                                respawn_hc_pane(
-                                    &ctx,
-                                    target_cwd,
-                                    space_machine.as_deref(),
-                                    Some(shared_pane_id),
-                                )
-                                .map(|res| (res, None, false))
-                            }
-                        };
-
-                        match pane_result {
-                            Ok(((pane_id, term_state, runtime), attached_addr, was_attached)) => {
-                                if identity_cwd.is_none() {
-                                    identity_cwd = Some(term_state.cwd.clone());
-                                }
-                                let term_id = term_state.id.clone();
-                                if let Some(addr) = attached_addr.as_deref() {
-                                    mapped_addresses.insert(addr.to_owned());
-                                    if was_attached {
-                                        if let Some(info) = live_by_addr.get(addr) {
-                                            if terminal_label_str(info, "herdr.space")
-                                                == Some(space.id.as_str())
-                                                && terminal_label_str(info, "herdr.tab")
-                                                    == Some(shared_tab.id.as_str())
-                                            {
-                                                record_terminal_label_cache(
-                                                    addr,
-                                                    &space.id,
-                                                    &shared_tab.id,
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                                terminals.insert(term_id.clone(), term_state);
-                                terminal_runtimes.insert(term_id.clone(), runtime);
-                                pane_pairs.push((pane_id, term_id));
-                                Some(pane_id)
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    address = %qualified_addr,
-                                    machine = ?space_machine,
-                                    err = %err,
-                                    "failed restoring hc pane from layout"
-                                );
-                                None
-                            }
-                        }
-                    })
-                else {
-                    continue;
-                };
-
-                let number = tab_idx + 1;
-                let tab_custom_name =
-                    (!shared_tab.name.trim().is_empty()).then(|| shared_tab.name.trim().to_owned());
-                if let Some(tab) =
-                    build_tab_shell(number, tab_custom_name, layout_node, pane_pairs, &ctx)
-                {
-                    tab_shared_ids.push((number, shared_tab.id.clone()));
-                    tabs.push(tab);
-                }
+            let machine_online = space_machine
+                .as_deref()
+                .is_none_or(|m| connected_set.contains(m));
+            if !machine_online {
+                preserved_offline
+                    .entry(space_machine.clone())
+                    .or_default()
+                    .push(space.clone());
+                continue;
             }
+            let (tabs, tab_shared_ids, identity_cwd) = build_tabs_from_space(
+                space,
+                space_machine.as_deref(),
+                &ctx,
+                &live_by_addr,
+                &finished_addrs,
+                &mut mapped_addresses,
+                &mut terminals,
+                &mut terminal_runtimes,
+                true,
+            );
 
             if tabs.is_empty() {
                 if space_machine.is_some() {
-                    preserved_offline_spaces.push(space.clone());
+                    preserved_offline
+                        .entry(space_machine.clone())
+                        .or_default()
+                        .push(space.clone());
                 }
                 continue;
             }
-            let ws_cwd = identity_cwd.unwrap_or_else(fallback_cwd);
-            let fallback_name = fallback_label_from_cwd(&ws_cwd);
-            let raw_name = if !space.name.trim().is_empty() {
-                space.name.trim().to_owned()
-            } else {
-                fallback_name.clone()
-            };
-            let custom_name = if space_machine.is_some() {
-                Some(format_workspace_display_name(
-                    space_machine.as_deref(),
-                    &raw_name,
-                ))
-            } else {
-                (raw_name != fallback_name).then(|| raw_name.clone())
-            };
-            let ws = build_workspace_shell(custom_name, ws_cwd, tabs, 0);
-            set_space_id(&ws.id, space.id.clone());
-            set_workspace_machine(&ws.id, space_machine);
-            set_workspace_raw_name(&ws.id, raw_name);
-            for (number, tab_shared_id) in tab_shared_ids {
-                set_tab_shared_id(&ws.id, number, tab_shared_id);
-            }
-            workspaces.push(ws);
+            workspaces.push(create_workspace_from_shared_space(
+                space,
+                space_machine,
+                tabs,
+                tab_shared_ids,
+                identity_cwd,
+            ));
         }
     }
 
     *unrestored_offline_spaces()
         .lock()
-        .unwrap_or_else(|p| p.into_inner()) = preserved_offline_spaces;
+        .unwrap_or_else(|p| p.into_inner()) = preserved_offline;
 
     for info in &initial_terminals {
         if terminal_is_closed(info) {
@@ -845,11 +1133,8 @@ pub fn restore_from_hc(
             }
         } else {
             let raw_name = fallback_label_from_cwd(&pane_cwd);
-            let label = machine
-                .as_deref()
-                .map(|m| format_workspace_display_name(Some(m), &raw_name));
             let ws = Workspace::from_existing_pane(
-                label,
+                None,
                 None,
                 pane_cwd,
                 moved,
@@ -868,54 +1153,20 @@ pub fn restore_from_hc(
         }
     }
 
-    for machine in configured_machines {
-        let already_present = workspaces
-            .iter()
-            .any(|ws| get_workspace_machine(&ws.id).as_deref() == Some(machine.as_str()));
-        if already_present {
-            continue;
-        }
-        set_default_spawn_machine(Some(machine.clone()));
-        let created = Workspace::new(
-            PathBuf::from("~"),
-            ctx.rows,
-            ctx.cols,
-            ctx.scrollback_limit_bytes,
-            ctx.host_terminal_theme,
-            ctx.host_terminal_appearance,
-            ctx.shell_config,
-            ctx.events.clone(),
-            ctx.render_notify.clone(),
-            ctx.render_dirty.clone(),
-        );
-        set_default_spawn_machine(None);
-        match created {
-            Ok((mut ws, term_state, runtime)) => {
-                let space_id = fresh_id("s");
-                let tab_id = fresh_id("tab");
-                let pane_id = ws.tabs[0].root_pane;
-                set_space_id(&ws.id, space_id);
-                set_workspace_machine(&ws.id, Some(machine.clone()));
-                set_workspace_raw_name(&ws.id, "~".to_owned());
-                ws.custom_name = Some(format_workspace_display_name(Some(&machine), "~"));
-                set_tab_shared_id(&ws.id, ws.tabs[0].number, tab_id);
-                set_pane_shared_id(pane_id, fresh_id("p"));
-                let term_id = term_state.id.clone();
-                terminals.insert(term_id.clone(), term_state);
-                terminal_runtimes.insert(term_id, runtime);
-                workspaces.push(ws);
-            }
-            Err(err) => {
-                tracing::warn!(
-                    machine = %machine,
-                    err = %err,
-                    "failed spawning initial workspace on configured hc remote machine"
-                );
-            }
-        }
+    if local_doc_polluted {
+        let snapshot = capture_hc_doc_snapshot(&workspaces);
+        write_hc_doc_snapshot(core, snapshot);
     }
 
-    spawn_hc_subscription_task(core.clone(), sub_channel, rx, snapshot, events);
+    spawn_hc_subscription_task(
+        core.clone(),
+        sub_channel,
+        rx,
+        snapshot,
+        configured,
+        initial_docs,
+        events,
+    );
 
     let active = (!workspaces.is_empty()).then_some(0);
     Ok(RestoredHcSession {
@@ -928,9 +1179,14 @@ pub fn restore_from_hc(
 }
 
 pub fn capture_hc_doc_snapshot(workspaces: &[Workspace]) -> HcDocSnapshot {
-    let mut spaces = Vec::with_capacity(workspaces.len());
+    let mut docs_by_machine: HashMap<Option<String>, Document> = HashMap::new();
+    docs_by_machine.insert(None, Document::default());
+    for tracked in tracked_doc_machines() {
+        docs_by_machine.entry(tracked).or_default();
+    }
+
     let mut labels = Vec::new();
-    let mut active_space_ids = HashSet::new();
+    let mut active_space_ids: HashMap<Option<String>, HashSet<String>> = HashMap::new();
 
     for ws in workspaces {
         let machine = get_workspace_machine(&ws.id);
@@ -964,14 +1220,15 @@ pub fn capture_hc_doc_snapshot(workspaces: &[Workspace]) -> HcDocSnapshot {
             });
             let Some(root) = layout_node_to_hc_node(tab.layout.root(), &mut |pane_id| {
                 let raw_address = pane_address(pane_id)?;
-                let address = qualify_address(machine.as_deref(), &raw_address);
+                let full_address = qualify_address(machine.as_deref(), &raw_address);
+                let doc_address = doc_terminal_address(machine.as_deref(), &full_address);
                 let shared_id = get_pane_shared_id(pane_id).unwrap_or_else(|| {
                     let id = fresh_id("p");
                     set_pane_shared_id(pane_id, id.clone());
                     id
                 });
-                labels.push((address.clone(), space_id.clone(), tab_id.clone()));
-                Some((shared_id, address))
+                labels.push((full_address, space_id.clone(), tab_id.clone()));
+                Some((shared_id, doc_address))
             }) else {
                 continue;
             };
@@ -992,26 +1249,89 @@ pub fn capture_hc_doc_snapshot(workspaces: &[Workspace]) -> HcDocSnapshot {
         if shared_tabs.is_empty() {
             continue;
         }
-        active_space_ids.insert(space_id.clone());
-        spaces.push(SharedSpace {
-            id: space_id,
-            name,
-            folder: ws.identity_cwd.display().to_string(),
-            tabs: shared_tabs,
-            rest: Default::default(),
-        });
+        active_space_ids
+            .entry(machine.clone())
+            .or_default()
+            .insert(space_id.clone());
+        docs_by_machine
+            .entry(machine)
+            .or_default()
+            .spaces
+            .push(SharedSpace {
+                id: space_id,
+                name,
+                folder: ws.identity_cwd.display().to_string(),
+                tabs: shared_tabs,
+                rest: Default::default(),
+            });
     }
 
     let preserved = unrestored_offline_spaces()
         .lock()
         .unwrap_or_else(|p| p.into_inner());
-    for space in preserved.iter() {
-        if active_space_ids.insert(space.id.clone()) {
-            spaces.push(space.clone());
+    for (machine, spaces) in preserved.iter() {
+        for space in spaces {
+            if active_space_ids
+                .entry(machine.clone())
+                .or_default()
+                .insert(space.id.clone())
+            {
+                docs_by_machine
+                    .entry(machine.clone())
+                    .or_default()
+                    .spaces
+                    .push(space.clone());
+            }
         }
     }
 
-    HcDocSnapshot { spaces, labels }
+    HcDocSnapshot {
+        docs_by_machine,
+        labels,
+    }
+}
+
+fn merge_target_doc_for_write(prev_doc: Document, target_doc: &mut Document) -> bool {
+    let mut prev_spaces: HashMap<String, SharedSpace> = prev_doc
+        .spaces
+        .into_iter()
+        .map(|space| (space.id.clone(), space))
+        .collect();
+
+    let mut unchanged = prev_spaces.len() == target_doc.spaces.len();
+    target_doc.spaces = std::mem::take(&mut target_doc.spaces)
+        .into_iter()
+        .map(|mut space| {
+            if let Some(prev) = prev_spaces.remove(&space.id) {
+                if prev.name != space.name
+                    || prev.folder != space.folder
+                    || prev.tabs.len() != space.tabs.len()
+                {
+                    unchanged = false;
+                }
+                space.rest = prev.rest;
+                let mut prev_tabs: HashMap<String, SharedTab> = prev
+                    .tabs
+                    .into_iter()
+                    .map(|tab| (tab.id.clone(), tab))
+                    .collect();
+                for tab in &mut space.tabs {
+                    if let Some(prev_tab) = prev_tabs.remove(&tab.id) {
+                        if prev_tab.name != tab.name || prev_tab.root != tab.root {
+                            unchanged = false;
+                        }
+                        tab.rest = prev_tab.rest;
+                    } else {
+                        unchanged = false;
+                    }
+                }
+            } else {
+                unchanged = false;
+            }
+            space
+        })
+        .collect();
+    unchanged
 }
 
 pub fn write_hc_doc_snapshot(core: &Core, snapshot: HcDocSnapshot) {
@@ -1031,41 +1351,41 @@ pub fn write_hc_doc_snapshot(core: &Core, snapshot: HcDocSnapshot) {
         }
     }
 
-    let (mut doc, current_ver) = match read_doc(core, None) {
-        Ok(pair) => pair,
-        Err(_) => (Document::default(), local_doc_version()),
-    };
-
-    let mut prev_spaces: HashMap<String, SharedSpace> = doc
-        .spaces
-        .into_iter()
-        .map(|space| (space.id.clone(), space))
-        .collect();
-
-    doc.spaces = snapshot
-        .spaces
-        .into_iter()
-        .map(|mut space| {
-            if let Some(prev) = prev_spaces.remove(&space.id) {
-                space.rest = prev.rest;
-                let mut prev_tabs: HashMap<String, SharedTab> = prev
-                    .tabs
-                    .into_iter()
-                    .map(|tab| (tab.id.clone(), tab))
-                    .collect();
-                for tab in &mut space.tabs {
-                    if let Some(prev_tab) = prev_tabs.remove(&tab.id) {
-                        tab.rest = prev_tab.rest;
-                    }
+    for (machine, mut target_doc) in snapshot.docs_by_machine {
+        let (prev_doc, current_ver) = match read_doc(core, machine.as_deref()) {
+            Ok(pair) => pair,
+            Err(err) => {
+                if machine.is_some() {
+                    tracing::warn!(machine = ?machine, err = %err, "skipping write to unreachable remote herdr-app doc");
+                    continue;
                 }
+                (
+                    Document::default(),
+                    super::client::machine_doc_version(machine.as_deref()),
+                )
             }
-            space
-        })
-        .collect();
+        };
 
-    match write_doc(core, None, current_ver, &doc) {
-        Ok(new_ver) => set_local_doc_version(new_ver),
-        Err(err) => tracing::warn!(err = %err, "failed to sync workspaces to herdr-app doc"),
+        if current_ver == 0 && target_doc.spaces.is_empty() && prev_doc.spaces.is_empty() {
+            continue;
+        }
+
+        if merge_target_doc_for_write(prev_doc, &mut target_doc) {
+            set_machine_doc_version(machine.as_deref(), current_ver);
+            record_known_doc_ids_for_doc(machine.as_deref(), &target_doc);
+            continue;
+        }
+
+        match write_doc(core, machine.as_deref(), current_ver, &target_doc) {
+            Ok(new_ver) => {
+                set_machine_doc_version(machine.as_deref(), new_ver);
+                set_last_written_version(machine.as_deref(), new_ver);
+                record_known_doc_ids_for_doc(machine.as_deref(), &target_doc);
+            }
+            Err(err) => {
+                tracing::warn!(machine = ?machine, err = %err, "failed to sync workspaces to herdr-app doc")
+            }
+        }
     }
 }
 
@@ -1103,6 +1423,330 @@ pub fn apply_hc_metadata_to_state(
     }
 
     (updates, dirty)
+}
+
+fn find_workspace_for_doc_space(
+    app: &App,
+    space: &SharedSpace,
+    space_machine: Option<&str>,
+) -> Option<usize> {
+    if let Some(idx) = app
+        .state
+        .workspaces
+        .iter()
+        .position(|ws| get_space_id(&ws.id).as_deref() == Some(space.id.as_str()))
+    {
+        return Some(idx);
+    }
+    for shared_tab in &space.tabs {
+        for raw_addr in shared_tab.root.terminal_addresses() {
+            let qual_addr = qualify_address(space_machine, &raw_addr);
+            if let Some(pane_id) = pane_for_address(&qual_addr) {
+                if let Some((ws_idx, _)) = app.find_pane(pane_id) {
+                    return Some(ws_idx);
+                }
+            }
+        }
+    }
+    None
+}
+
+fn find_tab_in_workspace_for_shared_tab(
+    ws: &Workspace,
+    space_machine: Option<&str>,
+    shared_tab: &SharedTab,
+) -> Option<usize> {
+    if let Some(idx) = ws
+        .tabs
+        .iter()
+        .position(|tab| get_tab_shared_id(&ws.id, tab.number).as_deref() == Some(&shared_tab.id))
+    {
+        return Some(idx);
+    }
+    for raw_addr in shared_tab.root.terminal_addresses() {
+        let qual_addr = qualify_address(space_machine, &raw_addr);
+        if let Some(pane_id) = pane_for_address(&qual_addr) {
+            if let Some(idx) = ws.find_tab_index_for_pane(pane_id) {
+                return Some(idx);
+            }
+        }
+    }
+    None
+}
+
+fn close_pane_from_hc_removal(app: &mut App, pane_id: PaneId) -> bool {
+    let Some((ws_idx, _)) = app.find_pane(pane_id) else {
+        unregister_pane(pane_id);
+        return false;
+    };
+    let terminal_id = app.state.terminal_id_for_pane(ws_idx, pane_id);
+    if let Some(tid) = terminal_id {
+        if let Some(runtime) = app.terminal_runtimes.remove(&tid) {
+            runtime.shutdown();
+        }
+    }
+    unregister_pane(pane_id);
+    let was_dirty = app.state.session_dirty;
+    app.state.handle_pane_died(pane_id);
+    app.state.session_dirty = was_dirty;
+    true
+}
+
+fn reconcile_hc_docs_into_app(
+    app: &mut App,
+    docs_by_machine: HashMap<Option<String>, (u64, Document)>,
+    terminals: &[Value],
+) -> bool {
+    let mut dirty = false;
+    let mut live_by_addr: HashMap<&str, &Value> = HashMap::new();
+    let mut finished_addrs: HashSet<&str> = HashSet::new();
+    for info in terminals {
+        let Some(addr) = terminal_address(info) else {
+            continue;
+        };
+        if terminal_is_closed(info) {
+            finished_addrs.insert(addr);
+        } else {
+            live_by_addr.insert(addr, info);
+        }
+    }
+
+    let mut shell_buf = None;
+    let ctx = app_attach_context(app, &mut shell_buf);
+    let mut mapped_addresses = HashSet::new();
+    let mut new_terminals = HashMap::new();
+    let mut new_runtimes = HashMap::new();
+    let mut new_workspaces = Vec::new();
+    let mut pending_tabs: Vec<(usize, Tab, String)> = Vec::new();
+    let mut pending_ws_updates: Vec<(usize, String, Option<String>, Option<String>)> = Vec::new();
+    let mut pending_tab_updates: Vec<(String, usize, String, Option<String>)> = Vec::new();
+    let mut panes_to_close: Vec<PaneId> = Vec::new();
+
+    for (machine_opt, (ver, doc)) in docs_by_machine {
+        set_machine_doc_version(machine_opt.as_deref(), ver);
+        let is_external_update = ver > last_written_version(machine_opt.as_deref());
+        let doc_space_ids: HashSet<String> = doc
+            .spaces
+            .iter()
+            .filter(|s| machine_opt.is_some() || is_space_remote_polluted(s).is_none())
+            .map(|s| s.id.clone())
+            .collect();
+        let doc_tab_ids: HashMap<String, HashSet<String>> = doc
+            .spaces
+            .iter()
+            .map(|s| (s.id.clone(), s.tabs.iter().map(|t| t.id.clone()).collect()))
+            .collect();
+
+        for space in &doc.spaces {
+            let space_machine = if machine_opt.is_none() {
+                if is_space_remote_polluted(space).is_some() {
+                    continue;
+                }
+                None
+            } else {
+                infer_space_machine(space, machine_opt.as_deref())
+            };
+
+            if let Some(ws_idx) = find_workspace_for_doc_space(app, space, space_machine.as_deref())
+            {
+                let ws = &app.state.workspaces[ws_idx];
+                let ws_id = ws.id.clone();
+                let next_name = (!space.name.trim().is_empty()).then(|| {
+                    strip_machine_prefix(space_machine.as_deref(), space.name.trim()).to_owned()
+                });
+                pending_ws_updates.push((
+                    ws_idx,
+                    space.id.clone(),
+                    space_machine.clone(),
+                    next_name,
+                ));
+
+                for shared_tab in &space.tabs {
+                    if let Some(tab_idx) = find_tab_in_workspace_for_shared_tab(
+                        ws,
+                        space_machine.as_deref(),
+                        shared_tab,
+                    ) {
+                        let tab_number = ws.tabs[tab_idx].number;
+                        let trimmed_tab = shared_tab.name.trim();
+                        let tab_name = (!trimmed_tab.is_empty()
+                            && trimmed_tab != format!("Tab {tab_number}"))
+                        .then(|| trimmed_tab.to_owned());
+                        pending_tab_updates.push((
+                            ws_id.clone(),
+                            tab_number,
+                            shared_tab.id.clone(),
+                            tab_name,
+                        ));
+                        continue;
+                    }
+
+                    let single_space = SharedSpace {
+                        id: space.id.clone(),
+                        name: space.name.clone(),
+                        folder: space.folder.clone(),
+                        tabs: vec![shared_tab.clone()],
+                        rest: Default::default(),
+                    };
+                    let (mut built_tabs, _, _) = build_tabs_from_space(
+                        &single_space,
+                        space_machine.as_deref(),
+                        &ctx,
+                        &live_by_addr,
+                        &finished_addrs,
+                        &mut mapped_addresses,
+                        &mut new_terminals,
+                        &mut new_runtimes,
+                        false,
+                    );
+                    if let Some(tab) = built_tabs.pop() {
+                        pending_tabs.push((ws_idx, tab, shared_tab.id.clone()));
+                    }
+                }
+
+                if is_external_update {
+                    if let Some(valid_tabs) = doc_tab_ids.get(&space.id) {
+                        for tab in &ws.tabs {
+                            let known = get_tab_shared_id(&ws.id, tab.number).is_some_and(|tid| {
+                                is_known_tab_id(machine_opt.as_deref(), &tid)
+                                    && !valid_tabs.contains(&tid)
+                            });
+                            if !known {
+                                continue;
+                            }
+                            let all_closed_or_missing =
+                                tab.layout.pane_ids().into_iter().all(|pid| {
+                                    pane_address(pid).is_none_or(|addr| {
+                                        !live_by_addr.contains_key(addr.as_str())
+                                    })
+                                });
+                            if all_closed_or_missing {
+                                panes_to_close.extend(tab.layout.pane_ids());
+                            }
+                        }
+                    }
+                }
+            } else {
+                let (tabs, tab_shared_ids, identity_cwd) = build_tabs_from_space(
+                    space,
+                    space_machine.as_deref(),
+                    &ctx,
+                    &live_by_addr,
+                    &finished_addrs,
+                    &mut mapped_addresses,
+                    &mut new_terminals,
+                    &mut new_runtimes,
+                    false,
+                );
+                if !tabs.is_empty() {
+                    new_workspaces.push(create_workspace_from_shared_space(
+                        space,
+                        space_machine,
+                        tabs,
+                        tab_shared_ids,
+                        identity_cwd,
+                    ));
+                }
+            }
+        }
+
+        let mut deferred_space_ids = HashSet::new();
+        if is_external_update {
+            for ws in &app.state.workspaces {
+                if get_workspace_machine(&ws.id) != machine_opt {
+                    continue;
+                }
+                let Some(sid) = get_space_id(&ws.id) else {
+                    continue;
+                };
+                if !is_known_space_id(machine_opt.as_deref(), &sid) || doc_space_ids.contains(&sid)
+                {
+                    continue;
+                }
+                let all_closed_or_missing =
+                    ws.tabs.iter().flat_map(|t| t.layout.pane_ids()).all(|pid| {
+                        pane_address(pid)
+                            .is_none_or(|addr| !live_by_addr.contains_key(addr.as_str()))
+                    });
+                if all_closed_or_missing {
+                    panes_to_close.extend(ws.tabs.iter().flat_map(|t| t.layout.pane_ids()));
+                } else {
+                    deferred_space_ids.insert(sid);
+                }
+            }
+        }
+
+        record_known_doc_ids_for_doc(machine_opt.as_deref(), &doc);
+        if !deferred_space_ids.is_empty() {
+            let mut merged_spaces: HashSet<String> =
+                doc.spaces.iter().map(|s| s.id.clone()).collect();
+            merged_spaces.extend(deferred_space_ids);
+            let tabs: HashSet<String> = doc
+                .spaces
+                .iter()
+                .flat_map(|s| s.tabs.iter().map(|t| t.id.clone()))
+                .collect();
+            set_known_doc_ids(machine_opt.as_deref(), merged_spaces, tabs);
+        }
+    }
+
+    for (id, terminal) in new_terminals {
+        app.state.terminals.insert(id, terminal);
+    }
+    for (id, runtime) in new_runtimes {
+        app.terminal_runtimes.insert(id, runtime);
+    }
+    for (ws_idx, space_id, machine, maybe_name) in pending_ws_updates {
+        if let Some(ws) = app.state.workspaces.get_mut(ws_idx) {
+            set_space_id(&ws.id, space_id);
+            set_workspace_machine(&ws.id, machine);
+            if let Some(name) = maybe_name {
+                set_workspace_raw_name(&ws.id, name.clone());
+                let fallback = fallback_label_from_cwd(&ws.identity_cwd);
+                let next_custom = (name != fallback).then_some(name);
+                if ws.custom_name != next_custom {
+                    ws.custom_name = next_custom;
+                    dirty = true;
+                }
+            }
+        }
+    }
+    for (ws_id, tab_number, shared_tab_id, maybe_name) in pending_tab_updates {
+        set_tab_shared_id(&ws_id, tab_number, shared_tab_id);
+        if let Some(ws) = app.state.workspaces.iter_mut().find(|w| w.id == ws_id) {
+            if let Some(tab) = ws.tabs.iter_mut().find(|t| t.number == tab_number) {
+                if tab.custom_name != maybe_name {
+                    tab.custom_name = maybe_name;
+                    dirty = true;
+                }
+            }
+        }
+    }
+    for (ws_idx, mut new_tab, shared_tab_id) in pending_tabs {
+        if let Some(ws) = app.state.workspaces.get_mut(ws_idx) {
+            let next_number = ws.next_public_tab_number;
+            ws.next_public_tab_number += 1;
+            new_tab.number = next_number;
+            set_tab_shared_id(&ws.id, next_number, shared_tab_id);
+            ws.tabs.push(new_tab);
+            dirty = true;
+        }
+    }
+    for ws in new_workspaces {
+        app.state.workspaces.push(ws);
+        if app.state.active.is_none() {
+            app.state.selected = 0;
+            app.state.active = Some(0);
+        }
+        dirty = true;
+    }
+    for pane_id in panes_to_close {
+        if close_pane_from_hc_removal(app, pane_id) {
+            dirty = true;
+        }
+    }
+
+    dirty
 }
 
 fn adopt_unmapped_hc_terminal(app: &mut App, info: &Value) -> bool {
@@ -1172,11 +1816,8 @@ fn adopt_unmapped_hc_terminal(app: &mut App, info: &Value) -> bool {
     } else {
         let raw_name = fallback_label_from_cwd(&cwd);
         let machine = machine_of_address(addr).map(str::to_owned);
-        let label = machine
-            .as_deref()
-            .map(|m| format_workspace_display_name(Some(m), &raw_name));
         let ws = Workspace::from_existing_pane(
-            label,
+            None,
             None,
             cwd,
             moved,
@@ -1205,37 +1846,65 @@ pub fn handle_hc_sync(
     app: &mut App,
     docs_changed: bool,
     terminals: Vec<Value>,
+    machines: Option<Vec<HcMachineInfo>>,
+    docs_by_machine: Option<HashMap<Option<String>, (u64, Document)>>,
 ) -> Vec<crate::app::actions::PaneStateUpdate> {
+    let was_dirty = app.state.session_dirty;
     let (updates, mut dirty) = apply_hc_metadata_to_state(&mut app.state, &terminals);
     for update in &updates {
         app.emit_pane_state_update(update);
     }
 
-    let mut adopted_any = false;
+    if let Some(next_machines) = machines {
+        if next_machines != configured_machines() {
+            set_configured_machines(next_machines);
+            dirty = true;
+        }
+    }
+
+    if let Some(docs) = docs_by_machine {
+        if reconcile_hc_docs_into_app(app, docs, &terminals) {
+            dirty = true;
+        }
+    } else if docs_changed {
+        if let Some(core) = super::global_core() {
+            let mut polled = HashMap::new();
+            if let Ok((doc, ver)) = read_doc(&core, None) {
+                polled.insert(None, (ver, doc));
+            }
+            for machine in configured_machines() {
+                if machine.connected {
+                    if let Ok((doc, ver)) = read_doc(&core, Some(&machine.name)) {
+                        polled.insert(Some(machine.name), (ver, doc));
+                    }
+                }
+            }
+            if !polled.is_empty() && reconcile_hc_docs_into_app(app, polled, &terminals) {
+                dirty = true;
+            }
+        }
+    }
+
     for info in &terminals {
         if terminal_is_closed(info) {
+            if let Some(addr) = terminal_address(info) {
+                if let Some(pane_id) = pane_for_address(addr) {
+                    if close_pane_from_hc_removal(app, pane_id) {
+                        dirty = true;
+                    }
+                }
+            }
             continue;
         }
         let Some(addr) = terminal_address(info) else {
             continue;
         };
         if !is_address_known(addr) && adopt_unmapped_hc_terminal(app, info) {
-            adopted_any = true;
             dirty = true;
         }
     }
 
-    if adopted_any {
-        app.state.mark_session_dirty();
-    }
-
-    if docs_changed {
-        if let Some(core) = super::global_core() {
-            if let Ok((_, version)) = read_doc(&core, None) {
-                set_local_doc_version(version);
-            }
-        }
-    }
+    app.state.session_dirty = was_dirty;
 
     if dirty {
         app.render_dirty.request_generic();
@@ -1247,6 +1916,7 @@ pub fn handle_hc_sync(
 
 #[cfg(test)]
 mod tests {
+    use super::super::client::register_pane_address;
     use super::*;
 
     #[test]
@@ -1338,6 +2008,11 @@ mod tests {
             "desk-local/t6"
         );
         assert_eq!(qualify_address(None, "t1"), "t1");
+        assert_eq!(
+            doc_terminal_address(Some("desk-local"), "desk-local/t6"),
+            "t6"
+        );
+        assert_eq!(doc_terminal_address(None, "t1"), "t1");
 
         let display = format_workspace_display_name(Some("oracle"), "BattleShip");
         assert_eq!(display, "oracle · BattleShip");
@@ -1353,5 +2028,202 @@ mod tests {
         assert!(!terminal_is_closed(
             &json!({ "address": "t1", "state": "live" })
         ));
+    }
+
+    #[test]
+    fn capture_hc_doc_snapshot_separates_local_and_remote_machines() {
+        super::super::client::reset_registry();
+        let local_ws = Workspace::test_new("local-proj");
+        let local_pane = local_ws.tabs[0].root_pane;
+        register_pane_address(local_pane, "t2".to_owned());
+        set_space_id(&local_ws.id, "sp_local".to_owned());
+        set_workspace_machine(&local_ws.id, None);
+
+        let remote_ws = Workspace::test_new("BattleShip");
+        let remote_pane = remote_ws.tabs[0].root_pane;
+        register_pane_address(remote_pane, "desk-local/t6".to_owned());
+        set_space_id(&remote_ws.id, "sp_remote".to_owned());
+        set_workspace_machine(&remote_ws.id, Some("desk-local".to_owned()));
+
+        let snap = capture_hc_doc_snapshot(&[local_ws, remote_ws]);
+        let local_doc = snap.docs_by_machine.get(&None).expect("local doc present");
+        let remote_doc = snap
+            .docs_by_machine
+            .get(&Some("desk-local".to_owned()))
+            .expect("remote doc present");
+
+        assert_eq!(local_doc.spaces.len(), 1);
+        assert_eq!(local_doc.spaces[0].id, "sp_local");
+        assert_eq!(
+            local_doc.spaces[0].tabs[0].root.terminal_addresses(),
+            vec!["t2".to_owned()]
+        );
+
+        assert_eq!(remote_doc.spaces.len(), 1);
+        assert_eq!(remote_doc.spaces[0].id, "sp_remote");
+        assert_eq!(
+            remote_doc.spaces[0].tabs[0].root.terminal_addresses(),
+            vec!["t6".to_owned()]
+        );
+        super::super::client::reset_registry();
+    }
+
+    #[test]
+    fn detects_polluted_remote_space_inside_local_doc() {
+        let polluted = SharedSpace {
+            id: "sp_remote".into(),
+            name: "desk-local · BattleShip".into(),
+            folder: "/home/lucas/BattleShip".into(),
+            tabs: vec![SharedTab {
+                id: "tb1".into(),
+                name: "Tab 1".into(),
+                root: HcNode::terminal_block("p1", "desk-local/t6"),
+                rest: Default::default(),
+            }],
+            rest: Default::default(),
+        };
+        assert_eq!(
+            is_space_remote_polluted(&polluted),
+            Some("desk-local".to_owned())
+        );
+
+        let clean_local = SharedSpace {
+            id: "sp_local".into(),
+            name: "mac".into(),
+            folder: "/Users/lucas".into(),
+            tabs: vec![SharedTab {
+                id: "tb2".into(),
+                name: "Tab 1".into(),
+                root: HcNode::terminal_block("p2", "t1"),
+                rest: Default::default(),
+            }],
+            rest: Default::default(),
+        };
+        assert_eq!(is_space_remote_polluted(&clean_local), None);
+    }
+
+    #[test]
+    fn write_merge_strips_polluted_spaces_from_local_doc() {
+        let polluted_space = SharedSpace {
+            id: "sp_remote".into(),
+            name: "BattleShip".into(),
+            folder: "/home/lucas/BattleShip".into(),
+            tabs: vec![SharedTab {
+                id: "tb1".into(),
+                name: "Tab 1".into(),
+                root: HcNode::terminal_block("p1", "desk-local/t6"),
+                rest: Default::default(),
+            }],
+            rest: Default::default(),
+        };
+        let prev_doc = Document {
+            spaces: vec![polluted_space],
+        };
+        let mut target_empty_local = Document::default();
+        assert!(!merge_target_doc_for_write(
+            prev_doc,
+            &mut target_empty_local
+        ));
+        assert!(target_empty_local.spaces.is_empty());
+
+        let clean_local = SharedSpace {
+            id: "sp_local".into(),
+            name: "herdr".into(),
+            folder: "/Users/lucas/herdr".into(),
+            tabs: vec![SharedTab {
+                id: "tb_local".into(),
+                name: "Tab 1".into(),
+                root: HcNode::terminal_block("p2", "t1"),
+                rest: Default::default(),
+            }],
+            rest: Default::default(),
+        };
+        let mut same_target = Document {
+            spaces: vec![clean_local.clone()],
+        };
+        assert!(merge_target_doc_for_write(
+            Document {
+                spaces: vec![clean_local],
+            },
+            &mut same_target
+        ));
+    }
+
+    #[test]
+    fn reconcile_hc_docs_updates_names_and_removes_deleted_external_tabs() {
+        super::super::client::reset_registry();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let ws = Workspace::test_new("BattleShip");
+        let pane_id = ws.tabs[0].root_pane;
+        let ws_id = ws.id.clone();
+        let tab_number = ws.tabs[0].number;
+        app.state.workspaces.push(ws);
+        app.state.selected = 0;
+        app.state.active = Some(0);
+
+        set_space_id(&ws_id, "sp_remote".into());
+        set_workspace_machine(&ws_id, Some("desk-local".into()));
+        set_tab_shared_id(&ws_id, tab_number, "tb_1".into());
+        register_pane_address(pane_id, "desk-local/t6".into());
+        set_known_doc_ids(
+            Some("desk-local"),
+            HashSet::from(["sp_remote".to_owned()]),
+            HashSet::from(["tb_1".to_owned()]),
+        );
+
+        let renamed_doc = Document {
+            spaces: vec![SharedSpace {
+                id: "sp_remote".into(),
+                name: "BattleShip-Renamed".into(),
+                folder: "/home/lucas/BattleShip".into(),
+                tabs: vec![SharedTab {
+                    id: "tb_1".into(),
+                    name: "deploy".into(),
+                    root: HcNode::terminal_block("p1", "t6"),
+                    rest: Default::default(),
+                }],
+                rest: Default::default(),
+            }],
+        };
+        let mut docs = HashMap::new();
+        docs.insert(Some("desk-local".to_owned()), (2, renamed_doc));
+        let terminals = vec![json!({ "address": "desk-local/t6", "state": "live" })];
+        assert!(reconcile_hc_docs_into_app(&mut app, docs, &terminals));
+        assert_eq!(
+            app.state.workspaces[0].custom_name.as_deref(),
+            Some("BattleShip-Renamed")
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].custom_name.as_deref(),
+            Some("deploy")
+        );
+
+        let empty_remote_doc = Document::default();
+        let mut live_remove_docs = HashMap::new();
+        live_remove_docs.insert(Some("desk-local".to_owned()), (3, empty_remote_doc.clone()));
+        assert!(!reconcile_hc_docs_into_app(
+            &mut app,
+            live_remove_docs,
+            &terminals
+        ));
+        assert_eq!(app.state.workspaces.len(), 1);
+
+        let finished_terminals = vec![json!({ "address": "desk-local/t6", "state": "finished" })];
+        let mut remove_docs = HashMap::new();
+        remove_docs.insert(Some("desk-local".to_owned()), (4, empty_remote_doc));
+        assert!(reconcile_hc_docs_into_app(
+            &mut app,
+            remove_docs,
+            &finished_terminals
+        ));
+        assert!(app.state.workspaces.is_empty());
+        super::super::client::reset_registry();
     }
 }

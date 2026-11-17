@@ -204,6 +204,10 @@ pub(crate) fn render_sidebar(
     state: &mut ShellRenderState<'_>,
     hits: &mut ShellHitMap,
 ) {
+    if super::hc_sidebar::is_grouped_mode(snapshot) {
+        super::hc_sidebar::render_grouped_sidebar(buffer, area, snapshot, config, state, hits);
+        return;
+    }
     let palette = &config.palette;
     render_sidebar_background(buffer, area, palette);
     hits.sidebar_divider = if area.is_empty() {
@@ -375,60 +379,7 @@ pub(crate) fn render_sidebar(
         );
     }
 
-    let footer_y = workspace_area.bottom().saturating_sub(1);
-    if config.mouse_capture {
-        hits.new_workspace = Rect::new(
-            workspace_area.x,
-            footer_y,
-            5.min(workspace_area.width),
-            u16::from(workspace_area.height > 0),
-        );
-        put_text(
-            buffer,
-            workspace_area.x,
-            footer_y,
-            workspace_area.width,
-            " new",
-            Style::default().fg(palette.overlay0),
-        );
-        let attention = super::super::global_menu::global_menu_attention(snapshot);
-        let launcher_width = if attention { 8 } else { 6 }.min(workspace_area.width);
-        hits.global_launcher = Rect::new(
-            workspace_area.right().saturating_sub(launcher_width),
-            footer_y,
-            launcher_width,
-            1,
-        );
-        if attention {
-            let start_x = workspace_area.right().saturating_sub(6);
-            put_text(
-                buffer,
-                start_x,
-                footer_y,
-                2,
-                "● ",
-                Style::default()
-                    .fg(palette.accent)
-                    .add_modifier(Modifier::BOLD),
-            );
-            put_text(
-                buffer,
-                start_x.saturating_add(2),
-                footer_y,
-                4,
-                "menu",
-                Style::default().fg(palette.overlay0),
-            );
-        } else {
-            put_right_text(
-                buffer,
-                workspace_area,
-                footer_y,
-                "menu",
-                Style::default().fg(palette.overlay0),
-            );
-        }
-    }
+    render_workspace_footer(buffer, workspace_area, snapshot, config, " new", hits);
 
     super::render_agent_panel(
         buffer,
@@ -455,25 +406,122 @@ pub(crate) fn render_sidebar(
     );
 }
 
+pub(in crate::client::shell) fn render_workspace_footer(
+    buffer: &mut Buffer,
+    workspace_area: Rect,
+    snapshot: &ClientShellSnapshot,
+    config: &ClientShellConfig,
+    new_label: &str,
+    hits: &mut ShellHitMap,
+) {
+    let palette = &config.palette;
+    let footer_y = workspace_area.bottom().saturating_sub(1);
+    if !config.mouse_capture {
+        return;
+    }
+    let attention = super::super::global_menu::global_menu_attention(snapshot);
+    let launcher_width = if attention { 8 } else { 6 }.min(workspace_area.width);
+    let max_new_width = workspace_area
+        .width
+        .saturating_sub(launcher_width.saturating_add(1));
+    let min_legacy_width = if new_label == " new" {
+        5.min(workspace_area.width)
+    } else {
+        0
+    };
+    let new_width = display_width(new_label)
+        .saturating_add(1)
+        .min(max_new_width)
+        .max(min_legacy_width)
+        .min(workspace_area.width);
+    hits.new_workspace = Rect::new(
+        workspace_area.x,
+        footer_y,
+        new_width,
+        u16::from(workspace_area.height > 0),
+    );
+    let draw_new_width = if new_label == " new" {
+        workspace_area.width
+    } else {
+        max_new_width
+    };
+    put_text(
+        buffer,
+        workspace_area.x,
+        footer_y,
+        draw_new_width,
+        new_label,
+        Style::default().fg(palette.overlay0),
+    );
+    hits.global_launcher = Rect::new(
+        workspace_area.right().saturating_sub(launcher_width),
+        footer_y,
+        launcher_width,
+        1,
+    );
+    if attention {
+        let start_x = workspace_area.right().saturating_sub(6);
+        put_text(
+            buffer,
+            start_x,
+            footer_y,
+            2,
+            "● ",
+            Style::default()
+                .fg(palette.accent)
+                .add_modifier(Modifier::BOLD),
+        );
+        put_text(
+            buffer,
+            start_x.saturating_add(2),
+            footer_y,
+            4,
+            "menu",
+            Style::default().fg(palette.overlay0),
+        );
+    } else {
+        put_right_text(
+            buffer,
+            workspace_area,
+            footer_y,
+            "menu",
+            Style::default().fg(palette.overlay0),
+        );
+    }
+}
+
 pub(crate) fn workspace_entries(
     snapshot: &ClientShellSnapshot,
     collapsed_groups: &HashSet<String>,
 ) -> Vec<WorkspaceEntry> {
+    let indices = (0..snapshot.workspaces.len()).collect::<Vec<_>>();
+    entries_for_workspace_indices(snapshot, &indices, collapsed_groups)
+}
+
+pub(in crate::client::shell) fn entries_for_workspace_indices(
+    snapshot: &ClientShellSnapshot,
+    indices: &[usize],
+    collapsed_groups: &HashSet<String>,
+) -> Vec<WorkspaceEntry> {
     let mut members = HashMap::<&str, Vec<usize>>::new();
-    for (index, workspace) in snapshot.workspaces.iter().enumerate() {
-        if let Some(worktree) = &workspace.worktree {
+    for &index in indices {
+        if let Some(worktree) = snapshot
+            .workspaces
+            .get(index)
+            .and_then(|workspace| workspace.worktree.as_ref())
+        {
             members.entry(&worktree.key).or_default().push(index);
         }
     }
     let grouped = members
         .iter()
-        .filter(|(_, indices)| {
-            indices.iter().any(|index| {
+        .filter(|(_, group_indices)| {
+            group_indices.iter().any(|index| {
                 snapshot.workspaces[*index]
                     .worktree
                     .as_ref()
                     .is_some_and(|worktree| worktree.is_linked_worktree)
-            }) && indices.iter().any(|index| {
+            }) && group_indices.iter().any(|index| {
                 snapshot.workspaces[*index]
                     .worktree
                     .as_ref()
@@ -484,7 +532,8 @@ pub(crate) fn workspace_entries(
         .collect::<HashSet<_>>();
     let mut emitted = HashSet::<&str>::new();
     let mut entries = Vec::new();
-    for (index, workspace) in snapshot.workspaces.iter().enumerate() {
+    for &index in indices {
+        let workspace = &snapshot.workspaces[index];
         let Some(worktree) = workspace
             .worktree
             .as_ref()

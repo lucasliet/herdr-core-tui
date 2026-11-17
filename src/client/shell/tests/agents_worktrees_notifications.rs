@@ -106,6 +106,7 @@ fn grouped_worktrees_render_parent_branch_and_indented_child() {
         number: 2,
         label: "repo-feature".into(),
         custom_label: false,
+        machine: None,
         branch: Some("worktree/feature".into()),
         git_ahead_behind: None,
         tokens: Vec::new(),
@@ -1681,4 +1682,177 @@ fn semantic_notifications_use_client_policy_and_stable_navigation_targets() {
     assert!(repaint);
     assert!(state.visible_notification.is_none());
     assert_eq!(state.pending_notifications.len(), 1);
+}
+
+#[test]
+fn hc_machines_sidebar_groups_by_machine_and_preserves_targets() {
+    let mut cfg = Config::default();
+    cfg.ui.sidebar.agents.rows = vec![vec![
+        crate::config::AgentSidebarToken::Agent,
+        crate::config::AgentSidebarToken::Machine,
+    ]];
+    let config = ClientShellConfig::from_config(&cfg);
+    let mut state = ClientShellState::new(config);
+    let mut projected = snapshot();
+    projected.hc_machines = vec![
+        crate::protocol::ClientShellHcMachine {
+            name: "desk-local".into(),
+            target: Some("desk".into()),
+            connected: true,
+        },
+        crate::protocol::ClientShellHcMachine {
+            name: "kimissh".into(),
+            target: Some("kimissh".into()),
+            connected: false,
+        },
+    ];
+    projected.workspaces[0].label = "mac-local".into();
+    projected.workspaces[0].focused = false;
+    projected.workspaces[0].machine = None;
+    projected.workspaces.push(ClientShellWorkspace {
+        workspace_id: "ws_2".into(),
+        active_tab_id: "tab_ws2".into(),
+        new_workspace_cwd: "/home/lucas/BattleShip".into(),
+        number: 2,
+        label: "BattleShip".into(),
+        custom_label: true,
+        machine: Some("desk-local".into()),
+        branch: Some("feature/remix-port".into()),
+        git_ahead_behind: None,
+        tokens: Vec::new(),
+        worktree: None,
+        focused: true,
+        agent_status: AgentStatus::Working,
+    });
+    projected.focused_workspace_id = Some("ws_2".into());
+    projected.tabs.push(ClientShellTab {
+        tab_id: "tab_ws2".into(),
+        workspace_id: "ws_2".into(),
+        number: 1,
+        label: "Tab 1".into(),
+        custom_label: false,
+        zoomed: false,
+        focused: true,
+        agent_status: AgentStatus::Working,
+    });
+    projected.panes.push(ClientShellPane {
+        pane_id: "pane_2".into(),
+        workspace_id: "ws_2".into(),
+        tab_id: "tab_ws2".into(),
+        label: None,
+        cwd: Some("/home/lucas/BattleShip".into()),
+        foreground_cwd: Some("/home/lucas/BattleShip".into()),
+        focused: true,
+        right_click_passthrough: false,
+    });
+    projected.agents = vec![ClientShellAgent {
+        pane_id: "pane_2".into(),
+        workspace_id: "ws_2".into(),
+        tab_id: "tab_ws2".into(),
+        name: Some("codex".into()),
+        display_agent: Some("codex".into()),
+        agent: Some("codex".into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: AgentStatus::Working,
+        state_change_seq: 1,
+        state_labels: Vec::new(),
+        tokens: Vec::new(),
+        focused: true,
+    }];
+
+    state.set_snapshot(Box::new(projected));
+    state.set_pane_surface(surface());
+    let frame = state.compose(106, 22).expect("grouped hc sidebar frame");
+    let text = frame
+        .cells
+        .chunks(frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let pos_local_hdr = text.find("▾ This computer").expect("local machine header");
+    let pos_local_ws = text.find("mac-local").expect("local workspace");
+    let pos_desk_hdr = text.find("▾ desk-local").expect("desk-local header");
+    let pos_desk_ws = text.find("BattleShip").expect("remote workspace");
+    let pos_kimi_hdr = text.find("▾ kimissh").expect("kimissh header");
+    assert!(pos_local_hdr < pos_local_ws);
+    assert!(pos_local_ws < pos_desk_hdr);
+    assert!(pos_desk_hdr < pos_desk_ws);
+    assert!(pos_desk_ws < pos_kimi_hdr);
+    assert!(text.contains("new · desk-local"));
+    assert!(text.contains("codex · desk-local"));
+    assert_eq!(state.hits.hc_machines.len(), 3);
+
+    let kimi_add = state.hits.hc_machines[2].add_button;
+    let create_remote = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: kimi_add.x,
+        row: kimi_add.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let [ClientShellAction::Endpoint { request, .. }] = &create_remote.actions[..] else {
+        panic!("clicking machine add button should emit WorkspaceCreate");
+    };
+    assert!(matches!(
+        &request.method,
+        crate::api::schema::Method::WorkspaceCreate(params)
+            if params.source_workspace_id.is_none()
+                && params
+                    .env
+                    .get(crate::hc::client::HC_MACHINE_ENV)
+                    .map(String::as_str)
+                    == Some("kimissh")
+    ));
+
+    let local_add = state.hits.hc_machines[0].add_button;
+    let create_local = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: local_add.x,
+        row: local_add.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    let [ClientShellAction::Endpoint { request, .. }] = &create_local.actions[..] else {
+        panic!("clicking local machine add button should emit WorkspaceCreate");
+    };
+    assert!(matches!(
+        &request.method,
+        crate::api::schema::Method::WorkspaceCreate(params)
+            if params.source_workspace_id.is_none()
+                && params
+                    .env
+                    .get(crate::hc::client::HC_MACHINE_ENV)
+                    .map(String::as_str)
+                    == Some("")
+    ));
+
+    let kimi_rect = state.hits.hc_machines[2].rect;
+    let collapse = state.handle_raw_events(vec![RawInputEvent::Mouse(MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column: kimi_rect.x + 1,
+        row: kimi_rect.y,
+        modifiers: KeyModifiers::empty(),
+    })]);
+    assert!(collapse.repaint);
+    assert!(state
+        .collapsed_hc_machines
+        .contains(&Some("kimissh".into())));
+    let collapsed_frame = state.compose(106, 22).expect("collapsed frame");
+    let collapsed_text = collapsed_frame
+        .cells
+        .chunks(collapsed_frame.width as usize)
+        .map(|row| {
+            row.iter()
+                .map(|cell| cell.symbol.as_str())
+                .collect::<String>()
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(collapsed_text.contains("▸ kimissh"));
+    assert!(collapsed_text.contains("new · kimissh"));
 }

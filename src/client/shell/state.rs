@@ -81,9 +81,18 @@ pub(super) enum ClientMobileTarget {
     Menu(usize),
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(super) struct HcMachineHit {
+    pub(super) rect: Rect,
+    pub(super) collapse_toggle: Rect,
+    pub(super) add_button: Rect,
+    pub(super) machine: Option<String>,
+}
+
 #[derive(Default)]
 pub(super) struct ShellHitMap {
     pub(super) machines: Vec<MachineHit>,
+    pub(super) hc_machines: Vec<HcMachineHit>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
     pub(super) workspace_scrollbar: Rect,
@@ -299,6 +308,7 @@ pub(super) enum ClientRenameTarget {
         source_workspace_id: Option<String>,
         cwd: Option<String>,
         suggested_name: String,
+        machine: Option<Option<String>>,
     },
     Workspace {
         workspace_id: String,
@@ -893,6 +903,8 @@ pub(crate) struct ClientShellState {
     pub(super) endpoints: Vec<ClientShellEndpoint>,
     pub(super) active_endpoint_id: ClientEndpointId,
     pub(super) collapsed_endpoints: HashSet<ClientEndpointId>,
+    pub(super) collapsed_hc_machines: HashSet<Option<String>>,
+    pub(super) selected_hc_machine: Option<Option<String>>,
     pub(super) mode: ClientShellMode,
     pub(super) navigate_workspace_id: Option<WorkspaceNavigationTarget>,
     pub(super) pending_workspace_highlight: Option<PendingWorkspaceHighlight>,
@@ -1067,6 +1079,8 @@ impl ClientShellState {
             endpoints: vec![local_endpoint()],
             active_endpoint_id: ClientEndpointId::Local,
             collapsed_endpoints: HashSet::new(),
+            collapsed_hc_machines: HashSet::new(),
+            selected_hc_machine: None,
             mode: ClientShellMode::Terminal,
             navigate_workspace_id: None,
             pending_workspace_highlight: None,
@@ -1182,14 +1196,26 @@ impl ClientShellState {
         snapshot: &ClientShellSnapshot,
     ) -> Vec<WorkspaceEntry> {
         let empty_collapsed_groups = HashSet::new();
-        if self.mobile_layout_active() {
-            render::workspace_entries(snapshot, &empty_collapsed_groups)
+        let collapsed_groups = if self.mobile_layout_active() {
+            &empty_collapsed_groups
         } else {
-            render::workspace_entries(
+            self.collapsed_groups_for_endpoint(&self.active_endpoint_id)
+                .unwrap_or(&empty_collapsed_groups)
+        };
+        if render::hc_sidebar::is_grouped_mode(snapshot) {
+            let empty_machines = HashSet::new();
+            let collapsed_machines = if self.mobile_layout_active() {
+                &empty_machines
+            } else {
+                &self.collapsed_hc_machines
+            };
+            render::hc_sidebar::grouped_workspace_entries(
                 snapshot,
-                self.collapsed_groups_for_endpoint(&self.active_endpoint_id)
-                    .unwrap_or(&empty_collapsed_groups),
+                collapsed_groups,
+                collapsed_machines,
             )
+        } else {
+            render::workspace_entries(snapshot, collapsed_groups)
         }
     }
 

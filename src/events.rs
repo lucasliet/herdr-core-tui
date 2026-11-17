@@ -221,5 +221,8 @@ pub enum AppEvent {
     HcSync {
         docs_changed: bool,
         terminals: Vec<serde_json::Value>,
+        machines: Option<Vec<crate::hc::client::HcMachineInfo>>,
+        docs_by_machine:
+            Option<std::collections::HashMap<Option<String>, (u64, crate::hc::doc::Document)>>,
     },
 }

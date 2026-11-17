@@ -35,11 +35,38 @@ impl ClientShellState {
         press: ClientWorkspacePress,
         outcome: &mut ClientShellInput,
     ) {
+        self.selected_hc_machine = None;
         self.focus_or_activate(
             press.endpoint_id,
             ClientEndpointFocusTarget::Workspace(press.workspace_id),
             outcome,
         );
+    }
+
+    pub(super) fn handle_hc_machine_click(
+        &mut self,
+        point: (u16, u16),
+        outcome: &mut ClientShellInput,
+    ) -> bool {
+        let Some((machine, clicked_add)) = self
+            .hits
+            .hc_machines
+            .iter()
+            .find(|hit| super::contains(hit.rect, point))
+            .map(|hit| (hit.machine.clone(), super::contains(hit.add_button, point)))
+        else {
+            return false;
+        };
+        self.selected_hc_machine = Some(machine.clone());
+        if clicked_add {
+            self.trigger_new_workspace_for_machine(Some(machine), outcome);
+            return true;
+        }
+        if !self.collapsed_hc_machines.remove(&machine) {
+            self.collapsed_hc_machines.insert(machine);
+        }
+        outcome.repaint = true;
+        true
     }
 
     pub(super) fn handle_endpoint_machine_click(

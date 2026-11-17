@@ -336,8 +336,89 @@ impl ClientShellState {
             })
     }
 
+    pub(super) fn active_hc_target_machine(&self) -> Option<Option<String>> {
+        let snapshot = self.snapshot.as_deref()?;
+        if !render::hc_sidebar::is_grouped_mode(snapshot) {
+            return None;
+        }
+        if let Some(selected) = &self.selected_hc_machine {
+            return Some(selected.clone());
+        }
+        let target_id = self.workspace_action_id();
+        Some(
+            target_id
+                .as_deref()
+                .and_then(|id| {
+                    snapshot
+                        .workspaces
+                        .iter()
+                        .find(|workspace| workspace.workspace_id == id)
+                })
+                .and_then(|workspace| workspace.machine.clone()),
+        )
+    }
+
+    pub(super) fn new_workspace_source_and_env(
+        &self,
+        target_machine: Option<&Option<String>>,
+    ) -> (Option<String>, HashMap<String, String>) {
+        let mut source_workspace_id = self.workspace_action_id();
+        let mut env = HashMap::new();
+        if let Some(machine) = target_machine {
+            if let (Some(snapshot), Some(source_id)) =
+                (self.snapshot.as_deref(), source_workspace_id.as_deref())
+            {
+                let same_machine = snapshot
+                    .workspaces
+                    .iter()
+                    .find(|workspace| workspace.workspace_id == source_id)
+                    .is_some_and(|workspace| &workspace.machine == machine);
+                if !same_machine {
+                    source_workspace_id = None;
+                }
+            }
+            env.insert(
+                crate::hc::client::HC_MACHINE_ENV.to_owned(),
+                machine.as_deref().unwrap_or("").to_owned(),
+            );
+        }
+        (source_workspace_id, env)
+    }
+
+    pub(super) fn trigger_new_workspace_for_machine(
+        &mut self,
+        machine_override: Option<Option<String>>,
+        outcome: &mut ClientShellInput,
+    ) {
+        let target_machine = machine_override.or_else(|| self.active_hc_target_machine());
+        if self.config.prompt_new_workspace_name {
+            self.open_new_workspace_overlay_for(target_machine);
+            outcome.repaint = true;
+            return;
+        }
+        let (source_workspace_id, env) = self.new_workspace_source_and_env(target_machine.as_ref());
+        self.push_endpoint_method(
+            crate::api::schema::Method::WorkspaceCreate(
+                crate::api::schema::WorkspaceCreateParams {
+                    source_workspace_id,
+                    cwd: None,
+                    focus: true,
+                    label: None,
+                    env,
+                },
+            ),
+            outcome,
+        );
+        outcome.repaint = true;
+    }
+
+    #[cfg(test)]
     pub(super) fn open_new_workspace_overlay(&mut self) {
-        let source_workspace_id = self.workspace_action_id();
+        self.open_new_workspace_overlay_for(self.active_hc_target_machine());
+    }
+
+    pub(super) fn open_new_workspace_overlay_for(&mut self, machine: Option<Option<String>>) {
+        let (source_workspace_id, _) = self.new_workspace_source_and_env(machine.as_ref());
         let cwd = self.snapshot.as_deref().and_then(|snapshot| {
             let workspace_id = source_workspace_id.as_deref()?;
             snapshot
@@ -358,6 +439,7 @@ impl ClientShellState {
                 source_workspace_id,
                 cwd,
                 suggested_name,
+                machine,
             },
         }));
     }
@@ -946,16 +1028,26 @@ impl ClientShellState {
                 source_workspace_id,
                 cwd,
                 suggested_name,
-            } => Some(crate::api::schema::Method::WorkspaceCreate(
-                crate::api::schema::WorkspaceCreateParams {
-                    source_workspace_id,
-                    cwd,
-                    focus: true,
-                    label: (!trimmed.is_empty() && trimmed != suggested_name)
-                        .then(|| trimmed.to_owned()),
-                    env: Default::default(),
-                },
-            )),
+                machine,
+            } => {
+                let mut env = HashMap::new();
+                if let Some(machine) = machine {
+                    env.insert(
+                        crate::hc::client::HC_MACHINE_ENV.to_owned(),
+                        machine.as_deref().unwrap_or("").to_owned(),
+                    );
+                }
+                Some(crate::api::schema::Method::WorkspaceCreate(
+                    crate::api::schema::WorkspaceCreateParams {
+                        source_workspace_id,
+                        cwd,
+                        focus: true,
+                        label: (!trimmed.is_empty() && trimmed != suggested_name)
+                            .then(|| trimmed.to_owned()),
+                        env,
+                    },
+                ))
+            }
             ClientRenameTarget::Workspace { workspace_id } => (!trimmed.is_empty()).then(|| {
                 crate::api::schema::Method::WorkspaceRename(
                     crate::api::schema::WorkspaceRenameParams {

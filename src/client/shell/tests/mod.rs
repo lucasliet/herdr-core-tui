@@ -27,6 +27,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
         tab_bar_right_separator: " ".into(),
         agent_view_label: None,
         agent_order: Vec::new(),
+        hc_machines: Vec::new(),
         workspaces: vec![ClientShellWorkspace {
             workspace_id: "ws_1".into(),
             active_tab_id: "tab_1".into(),
@@ -34,6 +35,7 @@ pub(super) fn snapshot() -> ClientShellSnapshot {
             number: 1,
             label: "client-shell".into(),
             custom_label: false,
+            machine: None,
             branch: Some("main".into()),
             git_ahead_behind: None,
             tokens: Vec::new(),

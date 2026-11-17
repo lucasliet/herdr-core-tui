@@ -209,9 +209,17 @@ impl App {
         if let AppEvent::HcSync {
             docs_changed,
             terminals,
+            machines,
+            docs_by_machine,
         } = ev
         {
-            return crate::hc::sync::handle_hc_sync(self, docs_changed, terminals);
+            return crate::hc::sync::handle_hc_sync(
+                self,
+                docs_changed,
+                terminals,
+                machines,
+                docs_by_machine,
+            );
         }
 
         let mut worktree_restore_updates = Vec::new();

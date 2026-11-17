@@ -943,11 +943,21 @@ pub struct ClientShellSnapshot {
     pub tab_bar_right_separator: String,
     pub agent_view_label: Option<String>,
     pub agent_order: Vec<String>,
+    #[serde(default)]
+    pub hc_machines: Vec<ClientShellHcMachine>,
     pub workspaces: Vec<ClientShellWorkspace>,
     pub tabs: Vec<ClientShellTab>,
     pub panes: Vec<ClientShellPane>,
     pub agents: Vec<ClientShellAgent>,
     pub commands: Vec<ClientShellCommand>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClientShellHcMachine {
+    pub name: String,
+    #[serde(default)]
+    pub target: Option<String>,
+    pub connected: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1025,6 +1035,8 @@ pub struct ClientShellWorkspace {
     pub number: usize,
     pub label: String,
     pub custom_label: bool,
+    #[serde(default)]
+    pub machine: Option<String>,
     pub branch: Option<String>,
     pub git_ahead_behind: Option<(usize, usize)>,
     pub tokens: Vec<(String, String)>,
@@ -2817,6 +2829,7 @@ mod tests {
             tab_bar_right_separator: " · ".into(),
             agent_view_label: None,
             agent_order: Vec::new(),
+            hc_machines: Vec::new(),
             workspaces: vec![ClientShellWorkspace {
                 workspace_id: "w1".into(),
                 active_tab_id: "w1:t1".into(),
@@ -2824,6 +2837,7 @@ mod tests {
                 number: 1,
                 label: "shell".into(),
                 custom_label: false,
+                machine: None,
                 branch: Some("main".into()),
                 git_ahead_behind: None,
                 tokens: Vec::new(),

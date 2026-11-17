@@ -618,6 +618,9 @@ impl ClientShellState {
                 .iter()
                 .any(|agent| &agent.pane_id == pane_id)
         });
+        let focus_changed = endpoint_id == &self.active_endpoint_id
+            && previous.and_then(|previous| previous.focused_workspace_id.as_deref())
+                != snapshot.focused_workspace_id.as_deref();
         let endpoint = &mut self.endpoints[index];
         endpoint.agent_recency = recency;
         endpoint.snapshot_generation = generation;
@@ -650,6 +653,9 @@ impl ClientShellState {
             {
                 endpoint.agent_view_projection = None;
             }
+        }
+        if focus_changed {
+            self.selected_hc_machine = None;
         }
     }
 
