@@ -67,8 +67,8 @@
       apps = forAllSystems (system: {
         default = {
           type = "app";
-          program = "${self.packages.${system}.default}/bin/herdr";
-          meta.description = "Run Herdr";
+          program = "${self.packages.${system}.default}/bin/herdr-core-tui";
+          meta.description = "Run herdr-core-tui (TUI frontend for herdr-core / hc)";
         };
       });
 

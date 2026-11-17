@@ -82,10 +82,10 @@ rustPlatform.buildRustPackage {
   doCheck = false;
 
   meta = {
-    description = "Terminal workspace manager for AI coding agents";
+    description = "Terminal UI frontend for herdr-core (hc)";
     homepage = "https://herdr.dev";
     license = lib.licenses.asl20;
-    mainProgram = "herdr";
+    mainProgram = "herdr-core-tui";
     platforms = lib.platforms.linux ++ lib.platforms.darwin;
   };
 }

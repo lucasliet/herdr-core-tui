@@ -254,6 +254,9 @@ def stage_bundle(
     package_path: Path,
     herdr_exe: Path,
     output_dir: Path,
+    binary_name: str = "herdr.exe",
+    alias_exe: Path | None = None,
+    alias_name: str | None = None,
 ) -> None:
     metadata = load_metadata(metadata_path)
     if architecture not in metadata["bundles"]:
@@ -262,8 +265,14 @@ def stage_bundle(
         raise ValueError(f"output directory already exists: {output_dir}")
     if not herdr_exe.is_file():
         raise ValueError(f"Herdr executable does not exist: {herdr_exe}")
+    if (alias_exe is None) != (alias_name is None):
+        raise ValueError("alias_exe and alias_name must be provided together")
+    if alias_exe is not None and not alias_exe.is_file():
+        raise ValueError(f"Alias executable does not exist: {alias_exe}")
 
     validate_static_msvc_runtime(herdr_exe.read_bytes(), herdr_exe.name)
+    if alias_exe is not None:
+        validate_static_msvc_runtime(alias_exe.read_bytes(), alias_exe.name)
 
     acquire_package(metadata["package"], package_path)
     bundle = metadata["bundles"][architecture]
@@ -275,7 +284,9 @@ def stage_bundle(
         validate_nuspec(archive, metadata["package"])
         staging = Path(temporary) / "bundle"
         staging.mkdir()
-        shutil.copy2(herdr_exe, staging / "herdr.exe")
+        shutil.copy2(herdr_exe, staging / binary_name)
+        if alias_exe is not None and alias_name is not None:
+            shutil.copy2(alias_exe, staging / alias_name)
 
         for item in bundle["files"]:
             try:
@@ -383,7 +394,7 @@ def build_local_bundle(metadata_path: Path) -> None:
             elif (
                 message.get("reason") == "compiler-artifact"
                 and message["manifest_path"] == str(PROJECT_ROOT / "Cargo.toml")
-                and message["target"]["name"] == "herdr"
+                and message["target"]["name"] in ("herdr-core-tui", "herdr")
                 and "bin" in message["target"]["kind"]
             ):
                 executable = Path(message["executable"])
@@ -404,21 +415,34 @@ def build_local_bundle(metadata_path: Path) -> None:
     )
 
 
-def expected_stage_files(metadata: dict[str, Any], architecture: str) -> set[str]:
-    files = {"herdr.exe", MARKER_PATH.as_posix()}
+def expected_stage_files(
+    metadata: dict[str, Any],
+    architecture: str,
+    binary_name: str = "herdr.exe",
+    alias_name: str | None = None,
+) -> set[str]:
+    files = {binary_name, MARKER_PATH.as_posix()}
+    if alias_name is not None:
+        files.add(alias_name)
     files.update(item["destination"] for item in metadata["bundles"][architecture]["files"])
     files.update(item["destination"] for item in metadata["notices"])
     return files
 
 
-def validate_stage(metadata_path: Path, architecture: str, stage_dir: Path) -> None:
+def validate_stage(
+    metadata_path: Path,
+    architecture: str,
+    stage_dir: Path,
+    binary_name: str = "herdr.exe",
+    alias_name: str | None = None,
+) -> None:
     metadata = load_metadata(metadata_path)
     actual = {
         path.relative_to(stage_dir).as_posix()
         for path in stage_dir.rglob("*")
         if path.is_file()
     }
-    expected = expected_stage_files(metadata, architecture)
+    expected = expected_stage_files(metadata, architecture, binary_name, alias_name)
     if actual != expected:
         raise ValueError(
             f"bundle layout mismatch; missing={sorted(expected - actual)}, unexpected={sorted(actual - expected)}"
@@ -428,7 +452,9 @@ def validate_stage(metadata_path: Path, architecture: str, stage_dir: Path) -> N
     # The executable is not hash-pinned (it changes every build), so re-check
     # it here to cover a direct archive of an existing stage or a swap after
     # staging.
-    validate_static_msvc_runtime((stage_dir / "herdr.exe").read_bytes(), "herdr.exe")
+    validate_static_msvc_runtime((stage_dir / binary_name).read_bytes(), binary_name)
+    if alias_name is not None:
+        validate_static_msvc_runtime((stage_dir / alias_name).read_bytes(), alias_name)
     for item in metadata["bundles"][architecture]["files"]:
         path = stage_dir / PurePosixPath(item["destination"])
         actual_hash = sha256_file(path)
@@ -442,9 +468,14 @@ def validate_stage(metadata_path: Path, architecture: str, stage_dir: Path) -> N
 
 
 def archive_bundle(
-    metadata_path: Path, architecture: str, stage_dir: Path, output_path: Path
+    metadata_path: Path,
+    architecture: str,
+    stage_dir: Path,
+    output_path: Path,
+    binary_name: str = "herdr.exe",
+    alias_name: str | None = None,
 ) -> None:
-    validate_stage(metadata_path, architecture, stage_dir)
+    validate_stage(metadata_path, architecture, stage_dir, binary_name, alias_name)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with zipfile.ZipFile(output_path, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in sorted(stage_dir.rglob("*")):
@@ -461,11 +492,16 @@ def parse_args() -> argparse.Namespace:
     stage.add_argument("--architecture", choices=("x86_64",), default="x86_64")
     stage.add_argument("--package", type=Path, required=True)
     stage.add_argument("--herdr-exe", type=Path, required=True)
+    stage.add_argument("--binary-name", default="herdr.exe")
+    stage.add_argument("--alias-exe", type=Path)
+    stage.add_argument("--alias-name")
     stage.add_argument("--output-dir", type=Path, required=True)
 
     archive = subparsers.add_parser("archive")
     archive.add_argument("--architecture", choices=("x86_64",), default="x86_64")
     archive.add_argument("--stage-dir", type=Path, required=True)
+    archive.add_argument("--binary-name", default="herdr.exe")
+    archive.add_argument("--alias-name")
     archive.add_argument("--output", type=Path, required=True)
     subparsers.add_parser("build-local")
     return parser.parse_args()
@@ -480,9 +516,19 @@ def main() -> None:
             args.package,
             args.herdr_exe,
             args.output_dir,
+            binary_name=args.binary_name,
+            alias_exe=args.alias_exe,
+            alias_name=args.alias_name,
         )
     elif args.command == "archive":
-        archive_bundle(args.metadata, args.architecture, args.stage_dir, args.output)
+        archive_bundle(
+            args.metadata,
+            args.architecture,
+            args.stage_dir,
+            args.output,
+            binary_name=args.binary_name,
+            alias_name=args.alias_name,
+        )
     else:
         build_local_bundle(args.metadata)
 

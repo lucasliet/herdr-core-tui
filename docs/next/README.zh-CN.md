@@ -1,12 +1,8 @@
-# herdr
-
+# herdr-core-tui (`hc-tui`)
 
 <p align="center">
-  <img src="assets/logo.png" alt="herdr" width="100" />
+  <img src="assets/logo.png" alt="herdr-core-tui" width="100" />
 </p>
-
-<p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#安装">安装</a> · <a href="https://herdr.dev/zh-cn/docs/quick-start/">快速开始</a> · <a href="https://herdr.dev/zh-cn/docs/">文档</a></p>
 
 <p align="center">
   <a href="README.md">English</a> · 简体中文
@@ -14,72 +10,66 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
 </p>
 
 ---
 
-https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
+**面向 [`herdr-core` (`hc`)](https://herdr.dev) 的终端 TUI 前端，基于传统 `herdr` Rust TUI 改造。**
 
-**智能体复用器，住在你的终端里。**
+本分支将原版 `herdr` Rust/Ratatui + `libghostty-vt` 终端界面改造为连接现有 `herdr-core` (`hc`) 守护进程的进程内前端，与桌面端 `herdr-app` 保持双向实时同步。
 
-- **每个智能体一目了然**——`blocked`、`working`、`done`。真实的终端视图，而不是包装过的转述。
-- **分离后工作继续运行**——关闭客户端或 SSH 断线后，后台服务器仍会保持终端运行。服务器或机器重启后，Herdr 会恢复已保存的布局，并可恢复受支持的智能体会话；原有进程不会保留。[会话状态 →](https://herdr.dev/zh-cn/docs/session-state/)
-- **多台机器，一个窗口**——将本地工作和已保存的 SSH 机器放在一起，使用汇总的智能体列表，各连接独立重连。[远程机器 →](https://herdr.dev/zh-cn/docs/connecting-machines/)
-- **智能体也能使用 herdr**——纯 socket api：智能体可以创建窗格、读取输出、互相等待。[智能体技能 →](https://herdr.dev/zh-cn/docs/agent-skill/) 在开发智能体？[为你的智能体添加 herdr 支持 →](https://herdr.dev/zh-cn/docs/add-herdr-support/)
-- **键盘和鼠标都是一等公民**——tmux 风格的前缀键，*以及*点击、拖动、分割。按当下的场景选择，而不是被工具锁死。
-- **插件**——扩展窗格和工作流。[浏览插件市场 →](https://herdr.dev/plugins/)
-- **单个 rust 二进制，没有 electron**——运行在你已经在用的任何终端里。
+## 本分支的定位（以及它不是什么）
 
----
+- **它是 `herdr-core` (`hc`) 的 TUI 前端：** 工作区、标签页、分屏布局、实时 PTY 流、智能体状态更新（通过 `hc` 的 OSC 7501）以及远程 SSH 机器均由 `hc` 管理，并通过共享的 `"herdr-app"` Automerge 文档实时同步。
+- **与 `herdr-app` 双向同步：** 在 `herdr-app` 中配置的工作区、标签页、布局与远程机器会动态出现在 `herdr-core-tui` 中；在 `herdr-core-tui` 中的修改同样会同步回 `herdr-app`。
+- **不会与 `hc`、`herdr-app` 或旧版 `herdr` 冲突：** 安装的二进制名为 `herdr-core-tui` 与 `hc-tui`（不使用 `herdr` 或 `hc`），且 `update` 命令不会覆盖现有 `hc` 安装。
+- **移除了旧版 `integrations` 安装器与钩子：** 移除设置中的 `integrations` 标签页及旧版 hook 安装逻辑，智能体状态直接依赖 `hc`。
+- **不再运行旧版独立 `herdr` 后台服务：** 所有终端会话直接托管在 `hc` 中。
+
+> 命名说明：[`followcat/hc-tui`](https://github.com/followcat/hc-tui) 是一个从零开发的第三方 `herdr-core` Rust TUI 客户端；本仓库（`herdr-core-tui`，别名 `hc-tui`）则是直接基于上游 [`herdrdev/herdr`](https://github.com/herdrdev/herdr) 改造的 `hc` 前端。若系统同时安装了其他工具，可直接调用 `herdr-core-tui` 避免重名。
+
+## 前置要求
+
+需要本地已安装 **`hc` (`herdr-core`)**（独立安装或随 `herdr-app` 附带）。
+
+`herdr-core-tui` 会按以下顺序自动查找 `hc` / `herdr-core`：
+
+1. `HC_BIN` 环境变量（或配置文件中的路径）
+2. `HERDR_CORE_DIRS` 环境变量
+3. 当前 `PATH` 与登录 shell 的 `PATH`
+4. 常见安装路径（`~/.local/bin`、`/opt/homebrew/bin`、`/usr/local/bin`、`~/.local/share/mise/shims`、`~/.nix-profile/bin`、`/run/current-system/sw/bin`、`~/.cargo/bin`，macOS 下的 `~/.local/share/herdr-core/...`，以及 Windows 下的 `%LOCALAPPDATA%\Programs\herdr-core`）
 
 ## 安装
 
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
-```
+### 预编译版本（Fork GitHub Releases）
 
-或者 `brew install herdr` · `mise use -g herdr` · Windows：`powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [受端点保护的 Windows](https://herdr.dev/zh-cn/docs/windows-beta/) · [二进制文件](https://github.com/herdrdev/herdr/releases)
+推送 `v*` 标签（或手动触发 Release 工作流）会自动构建并发布 `-core-tui` 命名的发行产物：
 
-然后在工作所在的目录启动它：
+- **Linux（`x86_64` / `aarch64`，静态 musl）：** `herdr-core-tui-linux-*.tar.gz`（含 `herdr-core-tui` 与 `hc-tui`）及单文件二进制 `herdr-core-tui-linux-*`
+- **macOS（`x86_64` / `aarch64`）：** `herdr-core-tui-macos-*.tar.gz`（含 `herdr-core-tui` 与 `hc-tui`）及单文件二进制 `herdr-core-tui-macos-*`
+- **Windows（`x86_64`）：** `herdr-core-tui-windows-x86_64.zip`（含 `herdr-core-tui.exe`、`hc-tui.exe` 与 ConPTY 运行时）
+- **校验文件：** `SHA256SUMS.txt`
 
-```bash
-herdr
-```
+### 从源码构建与安装
 
-运行你的智能体、分割窗格，然后安心离开。`ctrl+b q` 分离，`herdr` 重新连接。[快速开始 →](https://herdr.dev/zh-cn/docs/quick-start/)
-
-## 文档
-
-所有文档都在 [herdr.dev/docs](https://herdr.dev/zh-cn/docs/)：[快速开始](https://herdr.dev/zh-cn/docs/quick-start/) · [核心概念](https://herdr.dev/zh-cn/docs/concepts/) · [受支持的智能体](https://herdr.dev/zh-cn/docs/agents/) · [键盘](https://herdr.dev/zh-cn/docs/keyboard/) · [配置](https://herdr.dev/zh-cn/docs/configuration/) · [会话状态](https://herdr.dev/zh-cn/docs/session-state/) · [连接机器](https://herdr.dev/zh-cn/docs/connecting-machines/) · [远程访问](https://herdr.dev/zh-cn/docs/persistence-remote/) · [集成](https://herdr.dev/zh-cn/docs/integrations/) · [为智能体添加 herdr 支持](https://herdr.dev/zh-cn/docs/add-herdr-support/) · [插件](https://herdr.dev/zh-cn/docs/plugins/) · [socket api](https://herdr.dev/zh-cn/docs/socket-api/)
-
-## 致谢
-
-<a href="https://terminaltrove.com/"><img src="assets/sponsors/terminal-trove.png" alt="Terminal Trove" width="200" /></a>
-
-[Terminal Trove](https://terminaltrove.com/) 以及 [SPONSORS.md](./SPONSORS.md) 中列出的每一位支持者——谢谢 🐑
-
-企业/合作：hey@herdr.dev
-
-## 智能体须知
-
-如果你是协助本仓库的 AI 智能体：在改动代码前阅读 [`AGENTS.md`](./AGENTS.md)，在创建 issue 或 PR 前阅读 [`CONTRIBUTING.md`](./CONTRIBUTING.md)。
-
-## 开发
+构建需要 Rust 与 Zig `0.16.0`（用于编译内置 `libghostty-vt`）。若将 Zig `0.16.0` 放在 `.toolchain/zig/zig` 或通过 `ZIG` 环境变量指定即可直接编译安装：
 
 ```bash
-git clone https://github.com/herdrdev/herdr
-cd herdr
-cargo build --release
-
-just test        # 单元测试
-just check       # 格式检查、测试和维护性检查
+cargo install --path . --locked
 ```
 
-## 许可证
+这会在 Cargo 的 `bin` 目录同时安装 `herdr-core-tui` 与 `hc-tui`。
 
-herdr 基于 [Apache License 2.0](LICENSE) 许可证发布。
+## 使用
+
+```bash
+herdr-core-tui
+# 或使用别名：
+hc-tui
+```
+
+## 致谢与许可证
+
+基于 [`herdrdev/herdr`](https://github.com/herdrdev/herdr) 分支开发。原项目支持者名单见 [`SPONSORS.md`](./SPONSORS.md)。
+
+采用 [Apache License 2.0](LICENSE) 开源许可。

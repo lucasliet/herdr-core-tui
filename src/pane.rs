@@ -1626,9 +1626,7 @@ impl PaneRuntimeIo {
     fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.duplicate_for_handoff(),
-            PaneRuntimeIo::Hc(_) => {
-                Err(std::io::Error::other("hc runtime has no PTY master fd"))
-            }
+            PaneRuntimeIo::Hc(_) => Err(std::io::Error::other("hc runtime has no PTY master fd")),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {
                 Err(std::io::Error::other("test runtime has no PTY master fd"))
@@ -3072,7 +3070,9 @@ impl PaneRuntime {
                     Some((hc_cols, hc_rows)),
                     serde_json::json!({}),
                 )
-                .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?
+                .inspect_err(
+                    |err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"),
+                )?
             };
             return Self::from_hc_terminal(
                 core,

@@ -2,8 +2,9 @@
 name = "herdr"
 version = "0.9.5"
 edition = "2021"
+default-run = "herdr-core-tui"
 build = "build.rs"
-description = "terminal workspace manager for AI coding agents"
+description = "Terminal UI frontend for herdr-core (hc)"
 license = "Apache-2.0"
 repository = "https://github.com/herdrdev/herdr"
 homepage = "https://herdr.dev"
@@ -19,6 +20,14 @@ include = [
     "LICENSE",
     "Cargo.toml",
 ]
+
+[[bin]]
+name = "herdr-core-tui"
+path = "src/main.rs"
+
+[[bin]]
+name = "hc-tui"
+path = "src/bin/hc-tui.rs"
 
 [workspace]
 members = ["crates/ghostty-vt"]

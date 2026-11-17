@@ -514,7 +514,7 @@ fn main() -> io::Result<()> {
         Ok(args) => args,
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("run 'herdr --help' for usage");
+            eprintln!("run 'herdr-core-tui --help' for usage");
             std::process::exit(2);
         }
     };
@@ -529,7 +529,7 @@ fn main() -> io::Result<()> {
         Ok(args) => args,
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("run 'herdr --help' for usage");
+            eprintln!("run 'herdr-core-tui --help' for usage");
             std::process::exit(2);
         }
     };
@@ -537,7 +537,7 @@ fn main() -> io::Result<()> {
         Ok(parsed) => parsed,
         Err(err) => {
             eprintln!("error: {err}");
-            eprintln!("run 'herdr --help' for usage");
+            eprintln!("run 'herdr-core-tui --help' for usage");
             std::process::exit(2);
         }
     };
@@ -552,7 +552,7 @@ fn main() -> io::Result<()> {
         })
     {
         eprintln!("error: --remote can only be used with the default launch command");
-        eprintln!("run 'herdr --help' for usage");
+        eprintln!("run 'herdr-core-tui --help' for usage");
         std::process::exit(2);
     }
 
@@ -580,108 +580,124 @@ fn main() -> io::Result<()> {
 
     if args.get(1).map(|s| s.as_str()) == Some("update") {
         println!(
-            "herdr-tui runs alongside your existing `hc` / `herdr-app` installation and does not self-update or overwrite `hc`."
+            "herdr-core-tui (alias hc-tui) runs alongside your existing `hc` / `herdr-app` installation and does not self-update or overwrite `hc`."
         );
         return Ok(());
     }
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
         platform::begin_cli_output();
-        println!("herdr — terminal workspace manager for AI coding agents");
+        println!("herdr-core-tui (alias hc-tui) — terminal UI frontend for herdr-core (hc)");
         println!();
-        println!("Usage: herdr [options]");
-        println!("       herdr --session <name> [options]");
-        println!("       herdr --machine <label-or-id> <command>");
-        println!("       herdr --remote <ssh-target> [--session <name>]");
-        println!("       herdr session attach <name>");
-        println!("       herdr completion zsh");
-        println!("       herdr update [--handoff]");
-        println!("       herdr channel set <stable|preview>");
-        println!("       herdr machine <subcommand> ...");
-        println!("       herdr server stop");
-        println!("       herdr server reload-config");
-        println!("       herdr api <subcommand> ...");
-        println!("       herdr completion <shell>");
-        println!("       herdr config <subcommand> ...");
-        println!("       herdr channel <subcommand> ...");
-        println!("       herdr workspace <subcommand> ...");
-        println!("       herdr worktree <subcommand> ...");
-        println!("       herdr tab <subcommand> ...");
-        println!("       herdr notification <subcommand> ...");
-        println!("       herdr agent <subcommand> ...");
-        println!("       herdr pane <subcommand> ...");
-        println!("       herdr session <subcommand> ...");
-        println!("       herdr integration <subcommand> ...");
+        println!("Usage: herdr-core-tui [options]   (alias: hc-tui)");
+        println!("       herdr-core-tui --session <name> [options]");
+        println!("       herdr-core-tui --machine <label-or-id> <command>");
+        println!("       herdr-core-tui --remote <ssh-target> [--session <name>]");
+        println!("       herdr-core-tui session attach <name>");
+        println!("       herdr-core-tui completion zsh");
+        println!("       herdr-core-tui update [--handoff]");
+        println!("       herdr-core-tui channel set <stable|preview>");
+        println!("       herdr-core-tui machine <subcommand> ...");
+        println!("       herdr-core-tui server stop");
+        println!("       herdr-core-tui server reload-config");
+        println!("       herdr-core-tui api <subcommand> ...");
+        println!("       herdr-core-tui completion <shell>");
+        println!("       herdr-core-tui config <subcommand> ...");
+        println!("       herdr-core-tui channel <subcommand> ...");
+        println!("       herdr-core-tui workspace <subcommand> ...");
+        println!("       herdr-core-tui worktree <subcommand> ...");
+        println!("       herdr-core-tui tab <subcommand> ...");
+        println!("       herdr-core-tui notification <subcommand> ...");
+        println!("       herdr-core-tui agent <subcommand> ...");
+        println!("       herdr-core-tui pane <subcommand> ...");
+        println!("       herdr-core-tui session <subcommand> ...");
+        println!("       herdr-core-tui integration <subcommand> ...");
         println!();
         println!("Common commands:");
         for (command, description) in [
-            ("herdr", "Launch or attach to the persistent session"),
             (
-                "herdr status [server|client]",
+                "herdr-core-tui",
+                "Launch the TUI frontend backed by herdr-core (hc)",
+            ),
+            ("hc-tui", "Alias executable that forwards to herdr-core-tui"),
+            (
+                "herdr-core-tui status [server|client]",
                 "Show local client and running server status",
             ),
-            ("herdr update", "Download and install the latest version"),
-            ("herdr completion zsh", "Generate shell completions for zsh"),
             (
-                "herdr server stop",
+                "herdr-core-tui update",
+                "Print notice (never overwrites existing `hc`)",
+            ),
+            (
+                "herdr-core-tui completion zsh",
+                "Generate shell completions for zsh",
+            ),
+            (
+                "herdr-core-tui server stop",
                 "Stop the running server via the API socket",
             ),
             (
-                "herdr channel set <stable|preview>",
+                "herdr-core-tui channel set <stable|preview>",
                 "Choose the stable or preview update channel",
             ),
             (
-                "herdr server reload-config",
+                "herdr-core-tui server reload-config",
                 "Reload config.toml in the running server",
             ),
             (
-                "herdr config reset-keys",
+                "herdr-core-tui config reset-keys",
                 "Back up config.toml and remove custom keybindings",
             ),
             (
-                "herdr channel <subcommand>",
+                "herdr-core-tui channel <subcommand>",
                 "Manage the stable or preview update channel",
             ),
-            ("herdr machine <subcommand>", "Manage saved SSH machines"),
             (
-                "herdr api <subcommand>",
+                "herdr-core-tui machine <subcommand>",
+                "Manage saved SSH machines",
+            ),
+            (
+                "herdr-core-tui api <subcommand>",
                 "Inspect socket API metadata and live runtime state",
             ),
             (
-                "herdr workspace <subcommand>",
+                "herdr-core-tui workspace <subcommand>",
                 "Workspace helpers over the socket API",
             ),
             (
-                "herdr worktree <subcommand>",
+                "herdr-core-tui worktree <subcommand>",
                 "Git worktree helpers over the socket API",
             ),
-            ("herdr tab <subcommand>", "Tab helpers over the socket API"),
             (
-                "herdr notification <subcommand>",
+                "herdr-core-tui tab <subcommand>",
+                "Tab helpers over the socket API",
+            ),
+            (
+                "herdr-core-tui notification <subcommand>",
                 "Notification helpers over the socket API",
             ),
             (
-                "herdr agent <subcommand>",
+                "herdr-core-tui agent <subcommand>",
                 "Agent/terminal helpers over the socket API",
             ),
             (
-                "herdr pane <subcommand>",
+                "herdr-core-tui pane <subcommand>",
                 "Pane control helpers over the socket API",
             ),
             (
-                "herdr session <subcommand>",
+                "herdr-core-tui session <subcommand>",
                 "Manage named persistent sessions",
             ),
             (
-                "herdr integration <subcommand>",
+                "herdr-core-tui integration <subcommand>",
                 "Manage built-in agent integrations",
             ),
         ] {
-            println!("  {command:<32} {description}");
+            println!("  {command:<42} {description}");
         }
         println!();
         println!("Advanced commands:");
-        println!("  {:<32} Run as headless server", "herdr server");
+        println!("  {:<42} Run as headless server", "herdr-core-tui server");
         println!();
         println!("Options:");
         println!("  --session <name>    Use or create a named persistent session");
@@ -706,7 +722,7 @@ fn main() -> io::Result<()> {
 
     if args.iter().any(|a| a == "--version" || a == "-V") {
         platform::begin_cli_output();
-        println!("herdr {}", crate::build_info::version());
+        println!("herdr-core-tui {}", crate::build_info::version());
         return Ok(());
     }
 
@@ -739,7 +755,7 @@ fn main() -> io::Result<()> {
         let arg_name = arg.split_once('=').map(|(name, _)| name).unwrap_or(arg);
         if arg.starts_with('-') && !known_flags.contains(&arg_name) {
             eprintln!("unknown option: {arg}");
-            eprintln!("run 'herdr --help' for usage");
+            eprintln!("run 'herdr-core-tui --help' for usage");
             std::process::exit(2);
         }
         if !arg.starts_with('-')

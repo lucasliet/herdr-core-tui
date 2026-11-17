@@ -70,11 +70,9 @@ fn main() {
     let zig_prefix = out_dir.join("zig-out");
 
     let toolchain_dir = manifest_dir.join("../../.toolchain");
-    let local_zig = toolchain_dir.join("zig").join(if cfg!(windows) {
-        "zig.exe"
-    } else {
-        "zig"
-    });
+    let local_zig = toolchain_dir
+        .join("zig")
+        .join(if cfg!(windows) { "zig.exe" } else { "zig" });
     let zig = env::var("ZIG").unwrap_or_else(|_| {
         if local_zig.is_file() {
             local_zig.to_string_lossy().into_owned()

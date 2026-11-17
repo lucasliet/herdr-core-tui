@@ -16,8 +16,7 @@ use crate::render_signal::RenderSignal;
 use crate::terminal::{TerminalId, TerminalRuntime, TerminalState, TerminalStateMutation};
 use crate::terminal_theme::{HostAppearance, TerminalTheme};
 use crate::workspace::{
-    discover_workspace_git_identity, fallback_label_from_cwd, git_branch, MovedPane, Tab,
-    Workspace,
+    discover_workspace_git_identity, fallback_label_from_cwd, git_branch, MovedPane, Tab, Workspace,
 };
 
 use super::client::{
@@ -256,7 +255,11 @@ fn fold_weighted_children(direction: Direction, mut items: Vec<(Node, f32)>) -> 
     }
     let rest = items.split_off(1);
     let (first_node, first_weight) = items.pop()?;
-    let rest_weight: f32 = rest.iter().map(|(_, weight)| *weight).sum::<f32>().max(0.01);
+    let rest_weight: f32 = rest
+        .iter()
+        .map(|(_, weight)| *weight)
+        .sum::<f32>()
+        .max(0.01);
     let total_weight = (first_weight + rest_weight).max(0.01);
     let ratio = (first_weight / total_weight).clamp(0.1, 0.9);
     let second_node = fold_weighted_children(direction, rest)?;
@@ -677,7 +680,11 @@ pub fn restore_from_hc(
                                 "address": qualified_addr,
                                 "cwd": space.folder,
                             });
-                            Some(spawn_hc_attached_pane(&ctx, &synthetic, Some(shared_pane_id)))
+                            Some(spawn_hc_attached_pane(
+                                &ctx,
+                                &synthetic,
+                                Some(shared_pane_id),
+                            ))
                         };
 
                         let pane_result = match attach_attempt {
@@ -740,8 +747,8 @@ pub fn restore_from_hc(
                 };
 
                 let number = tab_idx + 1;
-                let tab_custom_name = (!shared_tab.name.trim().is_empty())
-                    .then(|| shared_tab.name.trim().to_owned());
+                let tab_custom_name =
+                    (!shared_tab.name.trim().is_empty()).then(|| shared_tab.name.trim().to_owned());
                 if let Some(tab) =
                     build_tab_shell(number, tab_custom_name, layout_node, pane_pairs, &ctx)
                 {
@@ -1334,17 +1341,17 @@ mod tests {
 
         let display = format_workspace_display_name(Some("oracle"), "BattleShip");
         assert_eq!(display, "oracle · BattleShip");
-        assert_eq!(
-            strip_machine_prefix(Some("oracle"), &display),
-            "BattleShip"
-        );
-        assert_eq!(
-            strip_machine_prefix(None, "BattleShip"),
-            "BattleShip"
-        );
+        assert_eq!(strip_machine_prefix(Some("oracle"), &display), "BattleShip");
+        assert_eq!(strip_machine_prefix(None, "BattleShip"), "BattleShip");
 
-        assert!(terminal_is_closed(&json!({ "address": "t1", "state": "finished" })));
-        assert!(terminal_is_closed(&json!({ "address": "t1", "closed": true })));
-        assert!(!terminal_is_closed(&json!({ "address": "t1", "state": "live" })));
+        assert!(terminal_is_closed(
+            &json!({ "address": "t1", "state": "finished" })
+        ));
+        assert!(terminal_is_closed(
+            &json!({ "address": "t1", "closed": true })
+        ));
+        assert!(!terminal_is_closed(
+            &json!({ "address": "t1", "state": "live" })
+        ));
     }
 }

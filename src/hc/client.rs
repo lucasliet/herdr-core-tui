@@ -74,7 +74,10 @@ impl EventLines {
 
     #[allow(dead_code)] // Retained for herdr-core event tracking parity.
     pub fn take_seen(&mut self) -> (HashMap<String, u64>, bool) {
-        (std::mem::take(&mut self.seen), std::mem::take(&mut self.resynced))
+        (
+            std::mem::take(&mut self.seen),
+            std::mem::take(&mut self.resynced),
+        )
     }
 
     fn note_seen(&mut self, address: &Value, labels: &Value) {
@@ -114,8 +117,8 @@ impl EventLines {
             .enumerate()
             .filter(|(_, b)| **b == b'\n')
             .map(|(i, _)| {
-                let line = serde_json::from_slice::<Value>(&self.pending[consumed..i])
-                    .unwrap_or_default();
+                let line =
+                    serde_json::from_slice::<Value>(&self.pending[consumed..i]).unwrap_or_default();
                 consumed = i + 1;
                 line
             })
@@ -154,10 +157,7 @@ impl EventLines {
         if matches!(kind, "created" | "restarted" | "labels") {
             self.note_seen(address, &data["labels"]);
         }
-        let at = self
-            .terminals
-            .iter()
-            .position(|t| &t["address"] == address);
+        let at = self.terminals.iter().position(|t| &t["address"] == address);
         let whole = match kind {
             "created" | "restarted" => Some(data),
             "labels" => data.get("record"),
@@ -257,10 +257,7 @@ pub enum Mismatch {
 }
 
 pub fn check_hello(hello: &Value) -> Result<(), Mismatch> {
-    let generation = hello
-        .get("generation")
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
+    let generation = hello.get("generation").and_then(Value::as_u64).unwrap_or(0);
     if generation > GENERATION {
         return Err(Mismatch::Newer { generation });
     }
@@ -405,9 +402,11 @@ impl Core {
             Err(error) => {
                 let _ = child.kill();
                 let _ = child.wait();
-                if let Some(msg) =
-                    connect_error(&errors.recv_timeout(Duration::from_secs(1)).unwrap_or_default())
-                {
+                if let Some(msg) = connect_error(
+                    &errors
+                        .recv_timeout(Duration::from_secs(1))
+                        .unwrap_or_default(),
+                ) {
                     return Err(io::Error::other(msg));
                 }
                 return Err(error);
@@ -470,9 +469,9 @@ impl Core {
                     }
                     let item = match kind {
                         DATA => Stream::Data(payload),
-                        CLOSE => Stream::Closed(
-                            serde_json::from_slice(&payload).unwrap_or(Value::Null),
-                        ),
+                        CLOSE => {
+                            Stream::Closed(serde_json::from_slice(&payload).unwrap_or(Value::Null))
+                        }
                         _ => continue,
                     };
                     let closing = matches!(item, Stream::Closed(_));
@@ -618,10 +617,7 @@ impl Core {
 
     #[allow(dead_code)] // Retained for herdr-core RPC parity.
     pub fn keep_terminal(&self, terminal: &str, off: bool) -> io::Result<Value> {
-        self.call(
-            "terminal.keep",
-            json!({ "terminal": terminal, "off": off }),
-        )
+        self.call("terminal.keep", json!({ "terminal": terminal, "off": off }))
     }
 
     pub fn subscribe(&self) -> io::Result<(u32, UnboundedReceiver<Stream>, Value)> {

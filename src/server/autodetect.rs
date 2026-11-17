@@ -330,7 +330,9 @@ impl Drop for InprocessEnvGuard {
             None => std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR),
         }
         match &self.prev_client_socket {
-            Some(val) => std::env::set_var(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR, val),
+            Some(val) => {
+                std::env::set_var(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR, val)
+            }
             None => std::env::remove_var(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR),
         }
         match &self.prev_startup_cwd {
@@ -387,7 +389,9 @@ pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
     crate::session::clear_explicit_session_override();
     let _env_guard = InprocessEnvGuard {
         prev_api_socket: std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR),
-        prev_client_socket: std::env::var_os(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR),
+        prev_client_socket: std::env::var_os(
+            crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
+        ),
         prev_startup_cwd: std::env::var_os(STARTUP_CWD_ENV_VAR),
         temp_dir: temp_dir.clone(),
     };
@@ -408,7 +412,8 @@ pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
     let server_thread = std::thread::Builder::new()
         .name("herdr-inprocess-server".into())
         .spawn(move || {
-            if let Err(err) = crate::server::headless::run_inprocess_server(stop_for_thread, ready_tx)
+            if let Err(err) =
+                crate::server::headless::run_inprocess_server(stop_for_thread, ready_tx)
             {
                 tracing::error!(err = %err, "in-process headless server exited with error");
             }

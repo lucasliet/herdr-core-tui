@@ -19,7 +19,8 @@ pub fn use_core(bin: PathBuf) {
             std::env::set_var("PATH", joined);
         }
     }
-    *BIN.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bin);
+    *BIN.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(bin);
 }
 
 fn path_for_core(
@@ -115,12 +116,19 @@ pub fn find(configured: Option<&str>) -> Option<PathBuf> {
             .filter(|c| c.is_file())
             .find(|c| version(c).is_some())
     };
-    if let Some(env_bin) = std::env::var("HC_BIN").ok().filter(|v| !v.trim().is_empty()) {
+    if let Some(env_bin) = std::env::var("HC_BIN")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+    {
         if let Some(found) = pick(vec![expand(&env_bin, &home)]) {
             return Some(found);
         }
     }
-    if let Some(found) = pick(configured.map(|c| vec![expand(c, &home)]).unwrap_or_default()) {
+    if let Some(found) = pick(
+        configured
+            .map(|c| vec![expand(c, &home)])
+            .unwrap_or_default(),
+    ) {
         return Some(found);
     }
     if let Some(dirs) = std::env::var_os("HERDR_CORE_DIRS") {
@@ -258,7 +266,8 @@ mod tests {
     fn find_returns_configured_executable_file_without_installing() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = std::env::temp_dir().join(format!("herdr-core-find-test-{}", std::process::id()));
+        let temp =
+            std::env::temp_dir().join(format!("herdr-core-find-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&temp);
         std::fs::create_dir_all(&temp).unwrap();
         let bin = temp.join("hc");

@@ -391,12 +391,7 @@ pub(super) enum ClientSettingsSection {
 }
 
 impl ClientSettingsSection {
-    pub(super) const ALL: &[Self] = &[
-        Self::Theme,
-        Self::Indicators,
-        Self::Sound,
-        Self::Toast,
-    ];
+    pub(super) const ALL: &[Self] = &[Self::Theme, Self::Indicators, Self::Sound, Self::Toast];
 
     pub(super) fn label(self) -> &'static str {
         match self {

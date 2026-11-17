@@ -425,6 +425,78 @@ class WindowsConptyPackageTests(unittest.TestCase):
         data[section_raw : section_raw + len(section)] = section
         return bytes(data)
 
+    def test_stage_and_archive_custom_binary_name_and_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            dll = self._pe(0x8664, b"dll")
+            x64_host = self._pe(0x8664, b"x64")
+            arm64_host = self._pe(0xAA64, b"arm64")
+            files = [
+                self._file("runtimes/win-x64/native/conpty.dll", "conpty/conpty.dll", dll, "0x8664"),
+                self._file(
+                    "build/native/runtimes/x64/OpenConsole.exe",
+                    "conpty/x64/OpenConsole.exe",
+                    x64_host,
+                    "0x8664",
+                ),
+                self._file(
+                    "build/native/runtimes/arm64/OpenConsole.exe",
+                    "conpty/arm64/OpenConsole.exe",
+                    arm64_host,
+                    "0xaa64",
+                ),
+            ]
+            nupkg = root / "conpty.nupkg"
+            self._write_package(nupkg, files, {item["source"]: data for item, data in zip(files, (dll, x64_host, arm64_host))})
+            metadata_path = root / "packaging" / "windows" / "conpty.json"
+            metadata_path.parent.mkdir(parents=True)
+            metadata_path.write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "package": {
+                            "id": "Microsoft.Windows.Console.ConPTY",
+                            "version": "1.24.260710001",
+                            "url": nupkg.as_uri(),
+                            "sha256": package.sha256_file(nupkg),
+                            "license": "MIT",
+                        },
+                        "bundles": {"x86_64": {"files": files}},
+                        "notices": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            primary = root / "herdr-core-tui.exe"
+            alias = root / "hc-tui.exe"
+            primary.write_bytes(self._pe_with_imports(0x8664, ["KERNEL32.dll"]))
+            alias.write_bytes(self._pe_with_imports(0x8664, ["KERNEL32.dll"]))
+            stage = root / "stage"
+            package.stage_bundle(
+                metadata_path,
+                "x86_64",
+                nupkg,
+                primary,
+                stage,
+                binary_name="herdr-core-tui.exe",
+                alias_exe=alias,
+                alias_name="hc-tui.exe",
+            )
+            output = root / "herdr-core-tui-windows-x86_64.zip"
+            package.archive_bundle(
+                metadata_path,
+                "x86_64",
+                stage,
+                output,
+                binary_name="herdr-core-tui.exe",
+                alias_name="hc-tui.exe",
+            )
+            with zipfile.ZipFile(output) as archive:
+                names = set(archive.namelist())
+                self.assertIn("herdr-core-tui.exe", names)
+                self.assertIn("hc-tui.exe", names)
+                self.assertNotIn("herdr.exe", names)
+
     @staticmethod
     def _file(source: str, destination: str, data: bytes, machine: str) -> dict[str, str]:
         return {

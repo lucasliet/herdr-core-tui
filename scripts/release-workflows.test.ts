@@ -7,13 +7,28 @@ const load = (name: string): any =>
   Bun.YAML.parse(readFileSync(new URL(`../.github/workflows/${name}.yml`, import.meta.url), "utf8"));
 const preview = load("preview");
 const release = load("release");
-const adminGate = release.jobs["validate-release-source"].steps[0];
+const adminGate = preview.jobs.preflight.steps[0];
 
-describe("official publishing workflow boundaries", () => {
-  test("publishing is tag-only while normal PR CI remains enabled", () => {
+describe("publishing workflow boundaries", () => {
+  test("preview is tag-only, fork release builds on v* tags and dispatch, and PR CI remains enabled", () => {
     expect(preview.on).toEqual({ push: { tags: ["preview-*"] } });
-    expect(release.on).toEqual({ push: { tags: ["v*"] } });
+    expect(release.on.push).toEqual({ tags: ["v*"] });
+    expect(release.on.workflow_dispatch).toBeDefined();
     expect(load("ci").on.pull_request).toBeDefined();
+  });
+
+  test("fork release builds -core-tui artifacts for all targets without upstream repo lock", () => {
+    const names = release.jobs.build.strategy.matrix.include.map((entry: any) => entry.name);
+    expect(names).toEqual([
+      "herdr-core-tui-linux-x86_64",
+      "herdr-core-tui-linux-aarch64",
+      "herdr-core-tui-macos-x86_64",
+      "herdr-core-tui-macos-aarch64",
+      "herdr-core-tui-windows-x86_64.zip",
+    ]);
+    expect(release.jobs.build.if).not.toContain("herdrdev/herdr");
+    expect(release.jobs.release.permissions).toEqual({ contents: "write" });
+    expect(release.jobs.release.needs).toBe("build");
   });
 
   test("preview checks do not require a workstation Windows SDK", () => {
@@ -27,10 +42,9 @@ describe("official publishing workflow boundaries", () => {
     expect(preview.jobs.publish.needs).toContain("build");
   });
 
-  test("each publishing job rechecks both actors before using credentials", () => {
+  test("each preview job rechecks both actors before using credentials", () => {
     for (const [workflow, names] of [
       [preview, ["preflight", "publish"]],
-      [release, ["validate-release-source", "release", "update-nix-package", "close-released-issues", "update-latest-json"]],
     ] as const) {
       for (const name of names) {
         const job = workflow.jobs[name];

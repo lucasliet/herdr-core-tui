@@ -89,8 +89,8 @@ mod surface_interest;
 // immediately wakes for any messages left in either external queue.
 const EXTERNAL_EVENT_DRAIN_LIMIT: usize = 64;
 
-pub use bootstrap::run_server;
 pub(crate) use bootstrap::run_inprocess_server;
+pub use bootstrap::run_server;
 use lifecycle::wait_for_live_handoff_response_write;
 #[cfg(unix)]
 use lifecycle::wait_for_old_public_sockets_to_close;

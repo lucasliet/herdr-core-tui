@@ -1,12 +1,7 @@
-# herdr
-
-
-<p align="center">
-  <img src="assets/logo.png" alt="herdr" width="100" />
-</p>
+# herdr-core-tui (`hc-tui`)
 
 <p align="center">
-  <a href="https://herdr.dev">herdr.dev</a> · <a href="#install">install</a> · <a href="https://herdr.dev/docs/quick-start/">quick start</a> · <a href="https://herdr.dev/docs/">docs</a>
+  <img src="assets/logo.png" alt="herdr-core-tui" width="100" />
 </p>
 
 <p align="center">
@@ -15,71 +10,98 @@
 
 <p align="center">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-666666?labelColor=333333" alt="Apache 2.0 license" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases"><img src="https://img.shields.io/github/downloads/herdrdev/herdr/total?labelColor=333333&color=666666" alt="total GitHub release downloads" /></a>
-  <a href="https://github.com/herdrdev/herdr/stargazers"><img src="https://img.shields.io/github/stars/herdrdev/herdr?labelColor=333333&color=666666&logo=github" alt="GitHub stars" /></a>
-  <a href="https://github.com/herdrdev/herdr/releases/latest"><img src="https://img.shields.io/github/v/release/herdrdev/herdr?label=release&labelColor=333333&color=666666" alt="latest stable release" /></a>
-  <a href="https://formulae.brew.sh/formula/herdr"><img src="https://img.shields.io/homebrew/v/herdr?label=homebrew&labelColor=333333&color=666666" alt="Homebrew version" /></a>
-  <a href="https://x.com/herdrdev"><img src="https://img.shields.io/badge/follow-%40herdrdev-000000?logo=x&logoColor=white" alt="follow @herdrdev on X" /></a>
 </p>
 
 ---
 
-https://github.com/user-attachments/assets/043ec09f-4bdd-41d5-aee0-8fda6b83e267
+**A terminal UI frontend for [`herdr-core` (`hc`)](https://herdr.dev), built on the legacy `herdr` Rust TUI.**
 
-**the runtime your coding agents live on.**
+This fork turns the classic `herdr` Rust/Ratatui + `libghostty-vt` terminal workspace UI into an in-process frontend backed by your existing `herdr-core` (`hc`) daemon, keeping full bidirectional parity with the `herdr-app` desktop UI.
 
-- **detach without stopping work** — herdr keeps terminals running in a background server when you close the client or lose your SSH connection. after a server or machine restart, herdr restores the saved layout and can resume supported agent sessions; the original processes do not survive. [session state →](https://herdr.dev/docs/session-state/)
-- **several machines, one window** — keep local work and saved ssh machines together, with a combined agent list and independent reconnects. [remote machines →](https://herdr.dev/docs/connecting-machines/)
-- **never hunt for the stuck one** — every pane is marked working, blocked, or idle. when an agent stops and needs an answer, herdr says so.
-- **agent-native** — agents drive herdr through the cli and socket api: they can spawn panes, prompt each other, and wait until another agent is genuinely blocked. [agent skill →](https://herdr.dev/docs/agent-skill/)
-- **runs what you already run** — claude code, codex, cursor, opencode, grok and the rest. herdr doesn't wrap or replace them; it owns their terminals. building an agent? [add herdr support →](https://herdr.dev/docs/add-herdr-support/)
-- **keyboard and mouse, both first-class** — tmux-style prefix keys *and* click, drag, split. pick per moment, not per tool.
-- **plugins** — extend panes and workflows. [browse the marketplace →](https://herdr.dev/plugins/)
-- **one rust binary, no electron** — runs in whatever terminal you already use.
+## What this fork is (and is not)
 
----
+- **It is a TUI frontend for `herdr-core` (`hc`):** workspaces, tabs, pane splits, live PTY streams, agent status updates (OSC 7501 via `hc`), and remote SSH machines are owned by `hc` and synchronized through the shared `"herdr-app"` Automerge document.
+- **Bidirectional parity with `herdr-app`:** changes you make in `herdr-app` (workspaces, tabs, layouts, local/remote machines) appear dynamically in `herdr-core-tui`, and changes you make in `herdr-core-tui` sync back to `herdr-app`.
+- **Does not conflict with or overwrite `hc`, `herdr-app`, or legacy `herdr`:** installed binaries are named `herdr-core-tui` and `hc-tui` (never `herdr` or `hc`), and `update` will never overwrite your existing `hc` installation.
+- **No legacy `integrations` installer/hooks:** legacy TUI hook management and the settings `integrations` tab were removed; agent lifecycle and status detection rely directly on `hc`.
+- **No standalone legacy server required:** instead of maintaining a separate legacy `herdr` server/socket state, sessions live inside `hc`.
 
-## install
+> Note on ecosystem naming: [`followcat/hc-tui`](https://github.com/followcat/hc-tui) is an independent, from-scratch Rust TUI client for `herdr-core`. This repository (`herdr-core-tui`, with convenience alias `hc-tui`) is a direct fork of upstream [`herdrdev/herdr`](https://github.com/herdrdev/herdr) wired onto `hc`. Invoke `herdr-core-tui` if you want to keep both installed side-by-side.
 
-```bash
-curl -fsSL https://herdr.dev/install.sh | sh
-```
+## Prerequisites
 
-or `brew install herdr` · `mise use -g herdr` · windows: `powershell -ExecutionPolicy Bypass -c "irm https://herdr.dev/install.ps1 | iex"` · [endpoint-protected Windows](https://herdr.dev/docs/windows-beta/) · [binaries](https://github.com/herdrdev/herdr/releases)
+You need **`hc` (`herdr-core`)** installed (either standalone or bundled with `herdr-app`).
 
-then start it where the work lives:
+`herdr-core-tui` resolves the `hc` / `herdr-core` binary automatically from:
 
-```bash
-herdr
-```
+1. `HC_BIN` environment variable (or configured path)
+2. `HERDR_CORE_DIRS` environment variable
+3. Current `PATH` and login-shell `PATH`
+4. Standard install locations (`~/.local/bin`, `/opt/homebrew/bin`, `/usr/local/bin`, `~/.local/share/mise/shims`, `~/.nix-profile/bin`, `/run/current-system/sw/bin`, `~/.cargo/bin`, plus `~/.local/share/herdr-core/...` on macOS and `%LOCALAPPDATA%\Programs\herdr-core` on Windows)
 
-run your agents, split panes, walk away. `ctrl+b q` detaches, `herdr` reattaches. [quick start →](https://herdr.dev/docs/quick-start/)
+## Install
 
-## docs
+### Prebuilt binaries (Fork GitHub Releases)
 
-everything lives at [herdr.dev/docs](https://herdr.dev/docs/): [quick start](https://herdr.dev/docs/quick-start/) · [concepts](https://herdr.dev/docs/concepts/) · [supported agents](https://herdr.dev/docs/agents/) · [keyboard](https://herdr.dev/docs/keyboard/) · [configuration](https://herdr.dev/docs/configuration/) · [session state](https://herdr.dev/docs/session-state/) · [connecting machines](https://herdr.dev/docs/connecting-machines/) · [remote](https://herdr.dev/docs/persistence-remote/) · [integrations](https://herdr.dev/docs/integrations/) · [add herdr support to your agent](https://herdr.dev/docs/add-herdr-support/) · [plugins](https://herdr.dev/docs/plugins/) · [socket api](https://herdr.dev/docs/socket-api/)
+Tagging `v*` (or running the Release workflow manually) publishes fork release artifacts under `-core-tui` naming:
 
-## thanks
+- **Linux (`x86_64` / `aarch64`, static musl):**
+  - `herdr-core-tui-linux-x86_64.tar.gz` / `herdr-core-tui-linux-aarch64.tar.gz` (contains both `herdr-core-tui` and `hc-tui`)
+  - Raw standalone binaries: `herdr-core-tui-linux-x86_64`, `herdr-core-tui-linux-aarch64`
+- **macOS (`x86_64` / `aarch64`):**
+  - `herdr-core-tui-macos-x86_64.tar.gz` / `herdr-core-tui-macos-aarch64.tar.gz` (contains both `herdr-core-tui` and `hc-tui`)
+  - Raw standalone binaries: `herdr-core-tui-macos-x86_64`, `herdr-core-tui-macos-aarch64`
+- **Windows (`x86_64`):**
+  - `herdr-core-tui-windows-x86_64.zip` (contains `herdr-core-tui.exe`, `hc-tui.exe`, and the pinned Microsoft ConPTY runtime)
+- **Checksums:** `SHA256SUMS.txt`
 
-every past sponsor and backer is listed in [SPONSORS.md](./SPONSORS.md) — thank you 🐑
-
-enterprise / partnership: hey@herdr.dev
-
-## agent instructions
-
-if you are an ai agent helping with this repository, read [`AGENTS.md`](./AGENTS.md) before making changes and read [`CONTRIBUTING.md`](./CONTRIBUTING.md) before opening issues or PRs.
-
-## development
+Example install from a `.tar.gz` release archive:
 
 ```bash
-git clone https://github.com/herdrdev/herdr
-cd herdr
-cargo build --release
-
-just test        # unit tests
-just check       # formatting, tests, and maintenance checks
+tar -xzf herdr-core-tui-macos-aarch64.tar.gz -C ~/.local/bin
 ```
 
-## license
+### Build and install from source
 
-Herdr is licensed under the [Apache License 2.0](LICENSE).
+Building requires Rust and Zig `0.16.0` (for the vendored `libghostty-vt` terminal core). If Zig `0.16.0` is placed at `.toolchain/zig/zig` (or pointed to via `ZIG`), `cargo` picks it up automatically:
+
+```bash
+cargo install --path . --locked
+```
+
+This installs both `herdr-core-tui` and the `hc-tui` launcher alias into Cargo's `bin` directory (`~/.cargo/bin`).
+
+## Usage
+
+```bash
+herdr-core-tui
+# or using the convenience alias:
+hc-tui
+```
+
+Run `herdr-core-tui --version` or `herdr-core-tui --help` for CLI options.
+
+## Releases & CI
+
+- `.github/workflows/ci.yml` runs formatting, lint/clippy, unit/contract checks, and Windows ConPTY package verification on pull requests and pushes to `master`.
+- `.github/workflows/release.yml` builds all 5 OS/architecture targets (`herdr-core-tui-*`) and publishes a GitHub Release on the fork whenever a `v*` tag is pushed (or when triggered manually with `workflow_dispatch`).
+- `.github/workflows/build-artifacts-manual.yml` provides on-demand artifact builds without creating a release.
+
+## Development
+
+```bash
+cargo build --offline --locked --bins
+cargo test --offline --locked --bin hc-tui
+cargo test --offline --locked --bin herdr-core-tui hc::
+bun test ./scripts/docs
+bun test scripts/release-workflows.test.ts
+python3 -m unittest scripts.test_package_windows_conpty
+```
+
+If you are an AI agent working in this repository, read [`AGENTS.md`](./AGENTS.md) before making changes.
+
+## Credits & License
+
+Forked from [`herdrdev/herdr`](https://github.com/herdrdev/herdr). Past upstream backers are listed in [`SPONSORS.md`](./SPONSORS.md).
+
+Licensed under the [Apache License 2.0](LICENSE).

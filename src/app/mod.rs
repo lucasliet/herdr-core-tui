@@ -447,7 +447,11 @@ impl App {
             restored_terminals = hc_session.terminals;
             restored_terminal_runtimes = hc_session.terminal_runtimes.into();
             crate::logging::session_restored(hc_session.workspaces.len(), "hc");
-            (hc_session.workspaces, hc_session.active, hc_session.selected)
+            (
+                hc_session.workspaces,
+                hc_session.active,
+                hc_session.selected,
+            )
         } else if let Some(snap) = snapshot {
             let history = config
                 .experimental
