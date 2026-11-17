@@ -9,6 +9,7 @@ pub(super) struct EndpointAgentPresentation {
     acknowledged: HashMap<String, u64>,
     completed: HashMap<String, u64>,
     working: HashSet<String>,
+    waiting: HashSet<String>,
     pending_completions: Option<(
         Option<u64>,
         crate::protocol::endpoint::EndpointAgentCompletions,
@@ -50,6 +51,7 @@ impl EndpointAgentPresentation {
             self.acknowledged.clear();
             self.completed.clear();
             self.working.clear();
+            self.waiting.clear();
             self.acknowledged.extend(
                 snapshot
                     .agents
@@ -68,6 +70,8 @@ impl EndpointAgentPresentation {
             .retain(|pane_id, _| pane_ids.contains(pane_id.as_str()));
         self.working
             .retain(|pane_id| pane_ids.contains(pane_id.as_str()));
+        self.waiting
+            .retain(|pane_id| pane_ids.contains(pane_id.as_str()));
         let completions = self
             .pending_completions
             .take()
@@ -82,11 +86,18 @@ impl EndpointAgentPresentation {
                 AgentStatus::Working => {
                     self.working.insert(agent.pane_id.clone());
                     self.completed.remove(&agent.pane_id);
+                    self.waiting.remove(&agent.pane_id);
                 }
                 AgentStatus::Blocked => {
                     self.completed.remove(&agent.pane_id);
+                    self.waiting.remove(&agent.pane_id);
                 }
-                AgentStatus::Idle | AgentStatus::Done => {
+                AgentStatus::Idle | AgentStatus::Done | AgentStatus::Waiting => {
+                    if agent.agent_status == AgentStatus::Waiting {
+                        self.waiting.insert(agent.pane_id.clone());
+                    } else {
+                        self.waiting.remove(&agent.pane_id);
+                    }
                     let observed_work = self.working.remove(&agent.pane_id);
                     let completed = completions.as_ref().map_or_else(
                         || {
@@ -108,6 +119,7 @@ impl EndpointAgentPresentation {
                 _ => {
                     self.working.remove(&agent.pane_id);
                     self.completed.remove(&agent.pane_id);
+                    self.waiting.remove(&agent.pane_id);
                 }
             }
             agent.agent_status = self.projected_status(agent);
@@ -163,11 +175,15 @@ impl EndpointAgentPresentation {
 
     fn projected_status(&self, agent: &ClientShellAgent) -> AgentStatus {
         match agent.agent_status {
-            AgentStatus::Idle | AgentStatus::Done => {
-                if self.seen(agent) {
-                    AgentStatus::Idle
-                } else {
+            AgentStatus::Idle | AgentStatus::Done | AgentStatus::Waiting => {
+                if !self.seen(agent) {
                     AgentStatus::Done
+                } else if agent.agent_status == AgentStatus::Waiting
+                    || self.waiting.contains(&agent.pane_id)
+                {
+                    AgentStatus::Waiting
+                } else {
+                    AgentStatus::Idle
                 }
             }
             status => status,
@@ -474,5 +490,27 @@ mod tests {
         assert!(!presentation.acknowledge_surface(&mut completed, &surface(1), Some(true)));
         assert!(!presentation.acknowledge_surface(&mut completed, &surface(2), Some(false)));
         assert_eq!(completed.agents[0].agent_status, AgentStatus::Done);
+    }
+
+    #[test]
+    fn waiting_stays_waiting_when_seen_and_yields_to_unacknowledged_done() {
+        let mut presentation = EndpointAgentPresentation::default();
+        let mut waiting = snapshot(AgentStatus::Waiting, 3, 1);
+        presentation.project_snapshot(&mut waiting);
+        assert_eq!(waiting.agents[0].agent_status, AgentStatus::Waiting);
+
+        let mut working = snapshot(AgentStatus::Working, 4, 2);
+        presentation.project_snapshot(&mut working);
+        assert_eq!(working.agents[0].agent_status, AgentStatus::Working);
+
+        let mut done_but_waiting = snapshot(AgentStatus::Waiting, 5, 3);
+        presentation.project_snapshot(&mut done_but_waiting);
+        assert_eq!(done_but_waiting.agents[0].agent_status, AgentStatus::Done);
+
+        assert!(presentation.acknowledge_surface(&mut done_but_waiting, &surface(3), Some(true)));
+        assert_eq!(
+            done_but_waiting.agents[0].agent_status,
+            AgentStatus::Waiting
+        );
     }
 }

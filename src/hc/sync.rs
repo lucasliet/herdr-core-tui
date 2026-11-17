@@ -691,6 +691,13 @@ fn spawn_hc_subscription_task(
     events: mpsc::Sender<AppEvent>,
 ) {
     let mut tracker = EventLines::new(&snapshot);
+    let (wait_tx, wait_rx) = tokio::sync::watch::channel(tracker.all_terminals().to_vec());
+    super::waiting::spawn_waiting_worker(
+        core.clone(),
+        tracker.all_terminals().to_vec(),
+        wait_rx,
+        events.clone(),
+    );
     let mut tracked_machines = initial_machines;
     let mut tracked_docs = initial_docs;
     tokio::spawn(async move {
@@ -751,6 +758,10 @@ fn spawn_hc_subscription_task(
             } else {
                 (None, None)
             };
+
+            if terminals_changed {
+                let _ = wait_tx.send(tracker.all_terminals().to_vec());
+            }
 
             let has_doc_updates = docs_update.is_some();
             if terminals_changed || docs_changed || machines_update.is_some() || has_doc_updates {
@@ -2335,6 +2346,11 @@ mod tests {
         );
         let ws = Workspace::test_new("repo");
         let pane_id = ws.tabs[0].root_pane;
+        let term_id = ws.tabs[0].panes[&pane_id].attached_terminal_id.clone();
+        app.state.terminals.insert(
+            term_id.clone(),
+            TerminalState::new(term_id, PathBuf::from("/tmp")),
+        );
         app.state.workspaces.push(ws);
         app.state.selected = 0;
         app.state.active = Some(0);
@@ -2373,6 +2389,20 @@ mod tests {
         });
         let _ = apply_hc_metadata_to_state(&mut app.state, &[seen_info]);
         assert!(app.state.workspaces[0].pane_state(pane_id).unwrap().seen);
+
+        super::super::client::set_waiting_addresses(HashSet::from(["oracle/t1".to_owned()]));
+        assert_eq!(
+            app.pane_metadata(0, pane_id).unwrap().agent_status,
+            crate::api::schema::AgentStatus::Waiting
+        );
+        app.state.workspaces[0]
+            .pane_state_mut(pane_id)
+            .unwrap()
+            .seen = false;
+        assert_eq!(
+            app.pane_metadata(0, pane_id).unwrap().agent_status,
+            crate::api::schema::AgentStatus::Done
+        );
         super::super::client::reset_registry();
     }
 }

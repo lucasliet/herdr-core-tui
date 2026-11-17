@@ -284,7 +284,12 @@ pub(super) fn navigator_rows(
     let filter = |status| match navigator.filter {
         Some(ClientNavigatorFilter::Blocked) => status == crate::api::schema::AgentStatus::Blocked,
         Some(ClientNavigatorFilter::Working) => status == crate::api::schema::AgentStatus::Working,
-        Some(ClientNavigatorFilter::Idle) => status == crate::api::schema::AgentStatus::Idle,
+        Some(ClientNavigatorFilter::Idle) => {
+            matches!(
+                status,
+                crate::api::schema::AgentStatus::Idle | crate::api::schema::AgentStatus::Waiting
+            )
+        }
         Some(ClientNavigatorFilter::Done) => status == crate::api::schema::AgentStatus::Done,
         None => true,
     };

@@ -754,6 +754,7 @@ impl Core {
             .is_some_and(|methods| methods.iter().any(|entry| entry.as_str() == Some(method)))
     }
 
+    #[allow(dead_code)]
     pub fn supports_feature(&self, feature: &str) -> bool {
         self.hello
             .get("features")
@@ -1373,6 +1374,7 @@ pub fn set_waiting_addresses(addresses: HashSet<String>) {
         .waiting_addresses = addresses;
 }
 
+#[allow(dead_code)]
 pub fn is_address_waiting(address: &str) -> bool {
     registry()
         .lock()

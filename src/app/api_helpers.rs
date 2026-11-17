@@ -106,6 +106,30 @@ pub(super) fn pane_agent_status(
     }
 }
 
+pub(super) fn pane_agent_status_for_pane(
+    state: crate::detect::AgentState,
+    seen: bool,
+    pane_id: crate::layout::PaneId,
+) -> crate::api::schema::AgentStatus {
+    match pane_agent_status(state, seen) {
+        crate::api::schema::AgentStatus::Idle if crate::hc::client::is_pane_waiting(pane_id) => {
+            crate::api::schema::AgentStatus::Waiting
+        }
+        status => status,
+    }
+}
+
+pub(super) fn agent_status_priority(status: crate::api::schema::AgentStatus) -> u8 {
+    match status {
+        crate::api::schema::AgentStatus::Blocked => 5,
+        crate::api::schema::AgentStatus::Done => 4,
+        crate::api::schema::AgentStatus::Working => 3,
+        crate::api::schema::AgentStatus::Waiting => 2,
+        crate::api::schema::AgentStatus::Idle => 1,
+        crate::api::schema::AgentStatus::Unknown => 0,
+    }
+}
+
 pub(super) fn read_terminal_snapshot(
     terminal: &crate::terminal::TerminalRuntime,
     source: crate::api::schema::ReadSource,

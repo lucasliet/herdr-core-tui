@@ -225,4 +225,6 @@ pub enum AppEvent {
         docs_by_machine:
             Option<std::collections::HashMap<Option<String>, (u64, crate::hc::doc::Document)>>,
     },
+    /// Background `hc` Waiting probe verdicts changed.
+    HcWaitingChanged,
 }

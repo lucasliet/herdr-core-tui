@@ -2,6 +2,7 @@ pub mod client;
 pub mod core_bin;
 pub mod doc;
 pub mod sync;
+pub mod waiting;
 
 pub use client::{
     global_core, register_pane_address, reset_registry, set_global_core,

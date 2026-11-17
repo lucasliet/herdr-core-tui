@@ -47,6 +47,7 @@ impl Tab {
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
     match (state, seen) {
         (AgentState::Blocked, _) => 4,
@@ -58,6 +59,7 @@ fn pane_attention_priority(state: AgentState, seen: bool) -> u8 {
 }
 
 impl Workspace {
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn aggregate_state(
         &self,
         terminals: &HashMap<TerminalId, TerminalState>,
