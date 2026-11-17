@@ -217,4 +217,9 @@ pub enum AppEvent {
     WorktreeRemoveFinished(Box<WorktreeRemoveResult>),
     /// Background worktree discovery completed for an API list/open request.
     WorktreeReadFinished(Box<WorktreeReadResult>),
+    /// Incremental state snapshot pushed from the shared `herdr-core` (`hc`) daemon.
+    HcSync {
+        docs_changed: bool,
+        terminals: Vec<serde_json::Value>,
+    },
 }

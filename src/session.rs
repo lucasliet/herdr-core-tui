@@ -156,6 +156,10 @@ pub(crate) fn clear_explicit_session_for_test() {
     EXPLICIT_SESSION_REQUESTED.store(false, Ordering::Relaxed);
 }
 
+pub(crate) fn clear_explicit_session_override() {
+    EXPLICIT_SESSION_REQUESTED.store(false, Ordering::Relaxed);
+}
+
 pub fn data_dir() -> PathBuf {
     data_dir_for(active_name().as_deref())
 }

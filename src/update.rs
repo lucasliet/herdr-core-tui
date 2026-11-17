@@ -1155,6 +1155,10 @@ pub(crate) struct SelfUpdateOptions {
     pub(crate) live_handoff: bool,
 }
 
+#[cfg_attr(
+    not(test),
+    allow(dead_code) // Retained for update CLI parser unit tests while self-update is disabled.
+)]
 pub(crate) fn parse_self_update_args(args: &[String]) -> Result<SelfUpdateOptions, String> {
     let mut options = SelfUpdateOptions::default();
     for arg in args {

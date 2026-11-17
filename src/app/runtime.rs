@@ -29,6 +29,7 @@ impl App {
 
     pub(crate) fn shutdown_terminal_runtime(&mut self, terminal_id: crate::terminal::TerminalId) {
         if let Some(runtime) = self.terminal_runtimes.remove(&terminal_id) {
+            runtime.mark_kill_on_shutdown();
             runtime.shutdown();
         }
     }

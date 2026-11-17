@@ -141,7 +141,7 @@ pub struct App {
     pub(crate) agent_metadata_deadline: Option<Instant>,
     pub(crate) pending_agent_resume_deadline: Option<Instant>,
     pub(crate) pending_host_appearance_deadline: Option<Instant>,
-    pane_host_appearance: Option<crate::terminal_theme::HostAppearance>,
+    pub(crate) pane_host_appearance: Option<crate::terminal_theme::HostAppearance>,
     startup_per_agent_delay: Duration,
     next_agent_resume_at: Option<Instant>,
     pub(crate) session_save_deadline: Option<Instant>,
@@ -402,9 +402,14 @@ impl App {
         let render_dirty = Arc::new(crate::render_signal::RenderSignal::new());
 
         // Try to restore previous session
+        let hc_core = crate::hc::global_core();
         let mut restored_terminals = std::collections::HashMap::new();
         let mut restored_terminal_runtimes = crate::terminal::TerminalRuntimeRegistry::new();
-        let snapshot = policy.restore_session.then(crate::persist::load).flatten();
+        let snapshot = if hc_core.is_none() {
+            policy.restore_session.then(crate::persist::load).flatten()
+        } else {
+            None
+        };
         let mut plugin_installation_leases = crate::plugin_installations::Leases::new();
         let mut plugin_installation_cleanup_allowed = true;
         if policy.persist_plugin_registry {
@@ -423,9 +428,27 @@ impl App {
             );
         }
         let session_writer = Arc::new(std::sync::Mutex::new(crate::persist::SessionWriter::new(
-            policy.restore_session && snapshot.is_none(),
+            policy.restore_session && snapshot.is_none() && hc_core.is_none(),
         )));
-        let (workspaces, active, selected) = if let Some(snap) = snapshot {
+        let (workspaces, active, selected) = if let Some(core) = hc_core {
+            let hc_session = crate::hc::sync::restore_from_hc(
+                &core,
+                24,
+                80,
+                config.advanced.scrollback_limit_bytes,
+                crate::pane::PaneShellConfig::new(
+                    &config.terminal.default_shell,
+                    config.terminal.shell_mode,
+                ),
+                event_tx.clone(),
+                render_notify.clone(),
+                render_dirty.clone(),
+            )?;
+            restored_terminals = hc_session.terminals;
+            restored_terminal_runtimes = hc_session.terminal_runtimes.into();
+            crate::logging::session_restored(hc_session.workspaces.len(), "hc");
+            (hc_session.workspaces, hc_session.active, hc_session.selected)
+        } else if let Some(snap) = snapshot {
             let history = config
                 .experimental
                 .pane_history
@@ -562,7 +585,11 @@ impl App {
             theme_runtime,
             host_terminal_appearance: None,
             host_terminal_appearance_explicit: false,
-            integration_recommendations: crate::integration::integration_recommendations(),
+            integration_recommendations: if crate::hc::global_core().is_some() {
+                Vec::new()
+            } else {
+                crate::integration::integration_recommendations()
+            },
             agent_manifest_summaries,
             agent_manifest_update_status: crate::detect::manifest_update::load_status(),
             installed_plugins: load_plugin_registry(

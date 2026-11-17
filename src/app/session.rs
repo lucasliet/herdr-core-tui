@@ -76,6 +76,28 @@ impl App {
             return;
         }
 
+        if let Some(core) = crate::hc::global_core() {
+            let hc_snapshot = crate::hc::sync::capture_hc_doc_snapshot(&self.state.workspaces);
+            self.pane_exit_checkpoint_pending = false;
+            self.session_save_deadline = None;
+            match std::thread::Builder::new()
+                .name("herdr-hc-session-save".into())
+                .spawn(move || crate::hc::sync::write_hc_doc_snapshot(&core, hc_snapshot))
+            {
+                Ok(thread) => self.session_save_thread = Some(thread),
+                Err(err) => {
+                    tracing::warn!(err = %err, "failed to spawn hc session save thread; saving inline");
+                    let core = crate::hc::global_core();
+                    if let Some(core) = core {
+                        let hc_snapshot =
+                            crate::hc::sync::capture_hc_doc_snapshot(&self.state.workspaces);
+                        crate::hc::sync::write_hc_doc_snapshot(&core, hc_snapshot);
+                    }
+                }
+            }
+            return;
+        }
+
         let job = self.capture_session_save_job();
         self.pane_exit_checkpoint_pending = false;
         self.session_save_deadline = None;
@@ -98,6 +120,13 @@ impl App {
         }
 
         if !self.policy.persist_session {
+            self.session_save_deadline = None;
+            return;
+        }
+
+        if let Some(core) = crate::hc::global_core() {
+            crate::hc::sync::sync_workspaces_to_hc(&core, &self.state.workspaces);
+            self.pane_exit_checkpoint_pending = false;
             self.session_save_deadline = None;
             return;
         }

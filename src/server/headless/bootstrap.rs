@@ -104,6 +104,92 @@ pub fn run_server() -> io::Result<()> {
     result
 }
 
+pub(crate) fn run_inprocess_server(
+    server_stop: crate::server::shutdown::ServerStop,
+    ready_tx: std::sync::mpsc::Sender<io::Result<std::sync::Arc<tokio::sync::Notify>>>,
+) -> io::Result<()> {
+    let loaded_config = config::Config::load();
+    #[cfg(windows)]
+    if loaded_config.config.server.allow_unelevated_clients {
+        crate::platform::allow_unelevated_clients();
+    }
+    let (api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+    let event_hub = api::EventHub::default();
+
+    let api_server = match api::start_server_with_stop_control(
+        api_tx.clone(),
+        event_hub.clone(),
+        server_stop.clone(),
+    ) {
+        Ok(server) => server,
+        Err(err) => {
+            let _ = ready_tx.send(Err(io::Error::new(err.kind(), err.to_string())));
+            return Err(err);
+        }
+    };
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            let io_err = io::Error::other(err.to_string());
+            let _ = ready_tx.send(Err(io::Error::other(err.to_string())));
+            return Err(io_err);
+        }
+    };
+
+    let result = rt.block_on(async {
+        let mut app = match app::App::try_new(
+            &loaded_config.config,
+            app::AppPolicy::PRODUCTION,
+            config::config_diagnostic_summary(&loaded_config.diagnostics),
+            api_rx,
+            event_hub,
+        ) {
+            Ok(app) => app,
+            Err(err) => {
+                let _ = ready_tx.send(Err(io::Error::new(err.kind(), err.to_string())));
+                return Err(err);
+            }
+        };
+        seed_startup_workspace_if_empty(&mut app);
+        let had_workspaces = !app.state.workspaces.is_empty();
+        if app.state.workspaces.is_empty() {
+            let fallback_cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("/"));
+            if let Err(err) = app.create_workspace_with_options(fallback_cwd, true) {
+                warn!(err = %err, "failed to create default startup workspace");
+                app.state.mode = app::Mode::Navigate;
+            }
+        }
+        if !had_workspaces && crate::hc::global_core().is_some() {
+            app.save_session_now();
+        }
+
+        let mut server = match HeadlessServer::new(
+            app,
+            &loaded_config.diagnostics,
+            Some(api_tx),
+            Some(api_server),
+            server_stop,
+        ) {
+            Ok(server) => server,
+            Err(err) => {
+                let _ = ready_tx.send(Err(io::Error::new(err.kind(), err.to_string())));
+                return Err(err);
+            }
+        };
+
+        let _ = ready_tx.send(Ok(server.app.render_notify.clone()));
+        server.app.run_plugin_startup_hooks();
+        server.run().await
+    });
+
+    rt.shutdown_timeout(Duration::from_millis(100));
+    result
+}
+
 fn seed_startup_workspace_if_empty(app: &mut app::App) {
     let Some(cwd) = take_startup_cwd() else {
         return;

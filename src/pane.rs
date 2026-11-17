@@ -1521,8 +1521,90 @@ pub struct PaneRuntime {
     detect_handle: Option<tokio::task::AbortHandle>,
 }
 
+struct HcPaneActorHandle {
+    pane_id: PaneId,
+    core: Arc<crate::hc::Core>,
+    channel: u32,
+    address: String,
+    kill_on_shutdown: Arc<AtomicBool>,
+    shutdown_called: Arc<AtomicBool>,
+    reader_abort: Option<tokio::task::AbortHandle>,
+}
+
+impl HcPaneActorHandle {
+    fn mark_kill_on_shutdown(&self) {
+        self.kill_on_shutdown.store(true, Ordering::Release);
+    }
+
+    fn shutdown(&self) {
+        if self.shutdown_called.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(handle) = &self.reader_abort {
+            handle.abort();
+        }
+        if self.kill_on_shutdown.load(Ordering::Acquire) {
+            if let Err(err) = self.core.kill_terminal(&self.address) {
+                warn!(
+                    pane = self.pane_id.raw(),
+                    address = %self.address,
+                    err = %err,
+                    "failed to kill hc terminal on pane shutdown"
+                );
+            }
+            let _ = self.core.rm_terminal(&self.address);
+            crate::hc::unregister_pane(self.pane_id);
+        }
+        self.core.detach(self.channel);
+    }
+
+    fn resize(
+        &self,
+        rows: u16,
+        cols: u16,
+        _cell_width_px: u32,
+        _cell_height_px: u32,
+        terminal_responses: Vec<Bytes>,
+    ) {
+        for response in terminal_responses {
+            self.core.automatic_input(self.channel, &response);
+        }
+        self.core.resize(self.channel, cols, rows);
+    }
+
+    fn try_write_user_input(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
+        self.core.input(self.channel, &bytes);
+        Ok(())
+    }
+
+    fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
+        if let Some(bytes) = response() {
+            self.core.automatic_input(self.channel, &bytes);
+        }
+    }
+
+    fn queue_user_input_submission(
+        &self,
+        text: Bytes,
+        enter: Bytes,
+        delay: std::time::Duration,
+    ) -> std::io::Result<std::sync::mpsc::Receiver<std::io::Result<()>>> {
+        let core = self.core.clone();
+        let channel = self.channel;
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            core.input(channel, &text);
+            std::thread::sleep(delay);
+            core.input(channel, &enter);
+            let _ = reply_tx.send(Ok(()));
+        });
+        Ok(reply_rx)
+    }
+}
+
 enum PaneRuntimeIo {
     Actor(PtyIoActorHandle),
+    Hc(HcPaneActorHandle),
     #[cfg(test)]
     TestChannel {
         sender: mpsc::Sender<Bytes>,
@@ -1534,6 +1616,7 @@ impl PaneRuntimeIo {
     fn shutdown(&self) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.shutdown(),
+            PaneRuntimeIo::Hc(actor) => actor.shutdown(),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {}
         }
@@ -1543,6 +1626,9 @@ impl PaneRuntimeIo {
     fn duplicate_handoff_fd(&self) -> std::io::Result<std::os::fd::RawFd> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.duplicate_for_handoff(),
+            PaneRuntimeIo::Hc(_) => {
+                Err(std::io::Error::other("hc runtime has no PTY master fd"))
+            }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {
                 Err(std::io::Error::other("test runtime has no PTY master fd"))
@@ -1554,6 +1640,7 @@ impl PaneRuntimeIo {
     fn foreground_process_group_id(&self) -> Option<u32> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.foreground_process_group_id(),
+            PaneRuntimeIo::Hc(_) => None,
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => None,
         }
@@ -1563,6 +1650,7 @@ impl PaneRuntimeIo {
     fn begin_handoff(&self, timeout: std::time::Duration) -> std::io::Result<()> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.begin_handoff(timeout),
+            PaneRuntimeIo::Hc(_) => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1578,6 +1666,7 @@ impl PaneRuntimeIo {
                     actor.rollback_handoff()
                 }
             }
+            PaneRuntimeIo::Hc(_) => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1587,6 +1676,7 @@ impl PaneRuntimeIo {
     fn release_after_commit(&self) -> std::io::Result<()> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.release_after_commit(),
+            PaneRuntimeIo::Hc(_) => Ok(()),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => Ok(()),
         }
@@ -1602,6 +1692,15 @@ impl PaneRuntimeIo {
     ) {
         match self {
             PaneRuntimeIo::Actor(actor) => {
+                actor.resize(
+                    rows,
+                    cols,
+                    cell_width_px,
+                    cell_height_px,
+                    terminal_responses,
+                );
+            }
+            PaneRuntimeIo::Hc(actor) => {
                 actor.resize(
                     rows,
                     cols,
@@ -1629,6 +1728,9 @@ impl PaneRuntimeIo {
             PaneRuntimeIo::Actor(actor) => {
                 actor.nudge_child_redraw_after_handoff(rows, cols, cell_width_px, cell_height_px);
             }
+            PaneRuntimeIo::Hc(actor) => {
+                actor.resize(rows, cols, cell_width_px, cell_height_px, Vec::new());
+            }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { .. } => {}
         }
@@ -1637,6 +1739,7 @@ impl PaneRuntimeIo {
     fn try_send_bytes(&self, bytes: Bytes) -> Result<(), mpsc::error::TrySendError<Bytes>> {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.try_write_user_input(bytes),
+            PaneRuntimeIo::Hc(actor) => actor.try_write_user_input(bytes),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => sender.try_send(bytes),
         }
@@ -1645,6 +1748,7 @@ impl PaneRuntimeIo {
     fn write_terminal_response(&self, response: impl FnOnce() -> Option<Bytes>) {
         match self {
             PaneRuntimeIo::Actor(actor) => actor.write_terminal_response(response),
+            PaneRuntimeIo::Hc(actor) => actor.write_terminal_response(response),
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
                 if let Some(bytes) = response() {
@@ -1670,6 +1774,10 @@ impl PaneRuntimeIo {
                     let _ = deadline;
                     actor.queue_user_input_submission(text, enter, delay)
                 }
+            }
+            PaneRuntimeIo::Hc(actor) => {
+                let _ = deadline;
+                actor.queue_user_input_submission(text, enter, delay)
             }
             #[cfg(test)]
             PaneRuntimeIo::TestChannel { sender, .. } => {
@@ -2231,6 +2339,12 @@ fn publish_reported_cwd(
 }
 
 impl PaneRuntime {
+    pub fn mark_kill_on_shutdown(&self) {
+        if let PaneRuntimeIo::Hc(actor) = &self.io {
+            actor.mark_kill_on_shutdown();
+        }
+    }
+
     pub fn shutdown(mut self) {
         if let Some(handle) = self.detect_handle.take() {
             handle.abort();
@@ -2682,6 +2796,230 @@ impl PaneRuntime {
         })
     }
 
+    // Runtime construction threads Core attachment, terminal size, theme, and render hooks together.
+    #[allow(clippy::too_many_arguments)]
+    fn from_hc_terminal(
+        core: Arc<crate::hc::Core>,
+        pane_id: PaneId,
+        address: String,
+        rows: u16,
+        cols: u16,
+        scrollback_limit_bytes: usize,
+        host_terminal_theme: crate::terminal_theme::TerminalTheme,
+        host_terminal_appearance: Option<crate::terminal_theme::HostAppearance>,
+        events: mpsc::Sender<AppEvent>,
+        render_notify: Arc<Notify>,
+        render_dirty: Arc<RenderSignal>,
+        initial_state: SpawnInitialState<'_>,
+        agent_detection: AgentDetection,
+    ) -> std::io::Result<Self> {
+        let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
+        let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
+            .map_err(|e| std::io::Error::other(e.to_string()))?;
+        if crate::kitty_graphics::is_enabled() {
+            terminal
+                .enable_kitty_graphics()
+                .map_err(|e| std::io::Error::other(e.to_string()))?;
+        }
+        let pane_terminal = GhosttyPaneTerminal::new(terminal, response_tx.clone())?;
+        pane_terminal.apply_host_terminal_theme(host_terminal_theme);
+        let _ = pane_terminal.apply_host_terminal_appearance(host_terminal_appearance);
+        pane_terminal.set_windows_powershell_prompt_cwd_reporting(
+            initial_state.windows_powershell_prompt_cwd_reporting,
+        );
+
+        let attached = core.attach(&address, cols, rows, serde_json::json!({}))?;
+        let initial_title = attached
+            .terminal
+            .get("title")
+            .and_then(serde_json::Value::as_str)
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned);
+        #[cfg(unix)]
+        pane_terminal.seed_terminal_title(initial_title);
+        #[cfg(not(unix))]
+        let _ = initial_title;
+
+        let is_remote = address.contains('/');
+        let initial_cwd = attached
+            .terminal
+            .pointer("/foreground/cwd")
+            .and_then(serde_json::Value::as_str)
+            .or_else(|| {
+                attached
+                    .terminal
+                    .get("cwd")
+                    .and_then(serde_json::Value::as_str)
+            })
+            .filter(|cwd| !cwd.is_empty())
+            .map(std::path::PathBuf::from)
+            .and_then(|path| {
+                if is_remote {
+                    path.is_absolute().then_some(path)
+                } else {
+                    usable_reported_cwd(path)
+                }
+            });
+
+        crate::hc::register_pane_address(pane_id, address.clone());
+
+        let terminal = Arc::new(PaneTerminal::new(pane_terminal));
+        let compression = TerminalCompressionTask::spawn(pane_id, terminal.clone());
+        let kitty_keyboard_flags = Arc::new(AtomicU16::new(0));
+        let content_write_lock = Arc::new(Mutex::new(()));
+        let child_pid = Arc::new(AtomicU32::new(0));
+        let reported_cwd = Arc::new(Mutex::new(initial_cwd.clone()));
+        let cwd_process_exited = Arc::new(AtomicBool::new(false));
+        let content_seq = Arc::new(AtomicU64::new(0));
+        let detection_content_seq = Arc::new(AtomicU64::new(0));
+        let full_lifecycle_authority_active = Arc::new(AtomicBool::new(false));
+        let self_reported_agent_active = Arc::new(AtomicBool::new(false));
+        let kill_on_shutdown = Arc::new(AtomicBool::new(false));
+        let shutdown_called = Arc::new(AtomicBool::new(false));
+
+        let channel = attached.channel;
+        let mut stream = attached.stream;
+        let reader_handle = {
+            let core = core.clone();
+            let address = address.clone();
+            let terminal = terminal.clone();
+            let response_writer = response_tx.clone();
+            let render_notify = render_notify.clone();
+            let render_dirty = render_dirty.clone();
+            let content_seq = content_seq.clone();
+            let content_write_lock = content_write_lock.clone();
+            let detection_content_seq = detection_content_seq.clone();
+            let child_pid = child_pid.clone();
+            let reported_cwd = reported_cwd.clone();
+            let cwd_process_exited = cwd_process_exited.clone();
+            let events = events.clone();
+            let compression_wake = compression.notifier();
+            let rt = tokio::runtime::Handle::current();
+            tokio::spawn(async move {
+                while let Some(item) = stream.recv().await {
+                    match item {
+                        crate::hc::Stream::Data(bytes) => {
+                            core.credit(channel, bytes.len());
+                            let _content_write_guard = match content_write_lock.lock() {
+                                Ok(guard) => guard,
+                                Err(poisoned) => poisoned.into_inner(),
+                            };
+                            content_seq.fetch_add(1, Ordering::AcqRel);
+                            let shell_pid = child_pid.load(Ordering::Acquire);
+                            let result = terminal.process_pty_bytes(
+                                pane_id,
+                                shell_pid,
+                                &bytes,
+                                &response_writer,
+                            );
+                            content_seq.fetch_add(1, Ordering::Release);
+                            drop(_content_write_guard);
+
+                            for resp in result.terminal_responses {
+                                core.automatic_input(channel, &resp);
+                            }
+                            compression_wake.wake();
+                            publish_terminal_bells(pane_id, result.terminal_bells, &events);
+                            if agent_detection == AgentDetection::Enabled {
+                                observe_detection_content_change(&bytes, &detection_content_seq);
+                            }
+                            let title_requested = result.terminal_title_changed
+                                && render_dirty.request_terminal_title(pane_id);
+                            let render_requested =
+                                result.request_render && render_dirty.request_pty(pane_id);
+                            if title_requested || render_requested {
+                                render_notify.notify_one();
+                            }
+                            if let Some(delay) = result.render_delay {
+                                let render_notify = render_notify.clone();
+                                let render_dirty = render_dirty.clone();
+                                rt.spawn(async move {
+                                    tokio::time::sleep(delay).await;
+                                    if render_dirty.request_pty(pane_id) {
+                                        render_notify.notify_one();
+                                    }
+                                });
+                            }
+                            if let Some(cwd) = result.reported_cwd.clone() {
+                                publish_reported_cwd(pane_id, cwd, &reported_cwd, &events);
+                            }
+                            for content in result.clipboard_writes {
+                                if let Err(err) =
+                                    events.try_send(AppEvent::ClipboardWrite { content })
+                                {
+                                    warn!(
+                                        pane = pane_id.raw(),
+                                        err = %err,
+                                        "failed to queue OSC 52 clipboard write"
+                                    );
+                                }
+                            }
+                        }
+                        crate::hc::Stream::Closed(_) => {
+                            cwd_process_exited.store(true, Ordering::Release);
+                            crate::hc::unregister_pane(pane_id);
+                            if let Err(err) = events
+                                .send(AppEvent::PaneDied {
+                                    pane_id,
+                                    exit_reason: crate::platform::ChildExitReason::Exited,
+                                })
+                                .await
+                            {
+                                error!(
+                                    pane = pane_id.raw(),
+                                    address = %address,
+                                    err = %err,
+                                    "failed to send PaneDied event"
+                                );
+                            }
+                            break;
+                        }
+                        crate::hc::Stream::Lost => {
+                            break;
+                        }
+                    }
+                }
+            })
+        };
+
+        if render_dirty.request_pty(pane_id) {
+            render_notify.notify_one();
+        }
+
+        let io = PaneRuntimeIo::Hc(HcPaneActorHandle {
+            pane_id,
+            core,
+            channel,
+            address,
+            kill_on_shutdown,
+            shutdown_called,
+            reader_abort: Some(reader_handle.abort_handle()),
+        });
+
+        Ok(Self {
+            pane_id,
+            terminal,
+            io,
+            current_size: Cell::new((rows, cols, 0, 0)),
+            child_pid,
+            reported_cwd,
+            persistence_cwd: Mutex::new(initial_cwd),
+            cwd_process_exited,
+            child_wait_completed: None,
+            kitty_keyboard_flags,
+            content_seq,
+            content_write_lock,
+            detection_content_seq,
+            full_lifecycle_authority_active,
+            self_reported_agent_active,
+            detect_reset_notify: Arc::new(Notify::new()),
+            pending_release: Arc::new(Mutex::new(None)),
+            preserve_processes_on_drop: true,
+            compression,
+            detect_handle: None,
+        })
+    }
+
     // Runtime construction needs to thread PTY size, environment, theme, render hooks, and detection policy together.
     #[allow(clippy::too_many_arguments)]
     fn spawn_command_builder(
@@ -2700,6 +3038,58 @@ impl PaneRuntime {
         agent_detection: AgentDetection,
     ) -> std::io::Result<Self> {
         crate::logging::pane_spawn_started(pane_id.raw(), rows, cols, scrollback_limit_bytes);
+
+        if let Some(core) = crate::hc::global_core() {
+            let hc_rows = rows.max(MIN_PANE_ROWS);
+            let hc_cols = cols.max(MIN_PANE_COLS);
+            let address = if let Some(address) = crate::hc::take_pending_attach_for_pane(pane_id) {
+                address
+            } else {
+                let argv: Vec<String> = cmd
+                    .get_argv()
+                    .iter()
+                    .filter_map(|arg| arg.to_str().map(str::to_owned))
+                    .collect();
+                let cwd = cmd
+                    .get_cwd()
+                    .and_then(|dir| dir.to_str())
+                    .filter(|dir| !dir.is_empty() && *dir != "~")
+                    .map(str::to_owned);
+                let on = crate::hc::client::take_pending_machine_for_pane(pane_id)
+                    .or_else(|| {
+                        cmd.get_env(crate::integration::HERDR_WORKSPACE_ID_ENV_VAR)
+                            .and_then(|v| v.to_str())
+                            .and_then(crate::hc::client::get_workspace_machine)
+                    })
+                    .or_else(crate::hc::client::default_spawn_machine);
+                let labels = crate::hc::take_pending_labels_for_pane(pane_id)
+                    .unwrap_or_else(|| serde_json::json!({}));
+                core.run(
+                    argv,
+                    cwd,
+                    labels,
+                    on.as_deref(),
+                    Some((hc_cols, hc_rows)),
+                    serde_json::json!({}),
+                )
+                .inspect_err(|err| error!(pane = pane_id.raw(), err = %err, "{spawn_error_message}"))?
+            };
+            return Self::from_hc_terminal(
+                core,
+                pane_id,
+                address,
+                hc_rows,
+                hc_cols,
+                scrollback_limit_bytes,
+                host_terminal_theme,
+                host_terminal_appearance,
+                events,
+                render_notify,
+                render_dirty,
+                initial_state,
+                agent_detection,
+            );
+        }
 
         let (response_tx, _response_rx) = mpsc::channel::<Bytes>(1);
         let mut terminal = crate::ghostty::Terminal::new(cols, rows, scrollback_limit_bytes)
@@ -3681,6 +4071,10 @@ impl PaneRuntime {
             PaneRuntimeIo::Actor(actor) => actor.validate_input_submission(bytes),
             #[cfg(windows)]
             PaneRuntimeIo::Actor(_) => {
+                let _ = bytes;
+                Ok(())
+            }
+            PaneRuntimeIo::Hc(_) => {
                 let _ = bytes;
                 Ok(())
             }

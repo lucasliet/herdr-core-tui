@@ -17,6 +17,10 @@ use crate::layout::PaneId;
 pub struct TerminalRuntime(crate::pane::PaneRuntime);
 
 impl TerminalRuntime {
+    pub fn mark_kill_on_shutdown(&self) {
+        self.0.mark_kill_on_shutdown();
+    }
+
     pub fn shutdown(self) {
         self.0.shutdown();
     }

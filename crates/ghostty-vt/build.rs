@@ -69,8 +69,29 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let zig_prefix = out_dir.join("zig-out");
 
-    let zig = env::var("ZIG").unwrap_or_else(|_| "zig".into());
+    let toolchain_dir = manifest_dir.join("../../.toolchain");
+    let local_zig = toolchain_dir.join("zig").join(if cfg!(windows) {
+        "zig.exe"
+    } else {
+        "zig"
+    });
+    let zig = env::var("ZIG").unwrap_or_else(|_| {
+        if local_zig.is_file() {
+            local_zig.to_string_lossy().into_owned()
+        } else {
+            "zig".into()
+        }
+    });
     let mut command = Command::new(&zig);
+    if toolchain_dir.exists() {
+        let local_cache = toolchain_dir.join("zig-cache");
+        if env::var_os("ZIG_GLOBAL_CACHE_DIR").is_none() {
+            command.env("ZIG_GLOBAL_CACHE_DIR", &local_cache);
+        }
+        if env::var_os("ZIG_LOCAL_CACHE_DIR").is_none() {
+            command.env("ZIG_LOCAL_CACHE_DIR", &local_cache);
+        }
+    }
     command
         .arg("build")
         .arg("--prefix")

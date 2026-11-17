@@ -396,7 +396,6 @@ impl ClientSettingsSection {
         Self::Indicators,
         Self::Sound,
         Self::Toast,
-        Self::Integrations,
     ];
 
     pub(super) fn label(self) -> &'static str {

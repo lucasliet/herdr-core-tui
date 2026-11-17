@@ -23,6 +23,7 @@ const SERVER_READY_TIMEOUT: Duration = Duration::from_secs(15);
 const SOCKET_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Timeout for checking the stable JSON API before attaching to the binary protocol socket.
+#[cfg(test)]
 const STATUS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Private daemon-start hint used to seed a fresh headless server from the
@@ -98,6 +99,7 @@ fn is_server_listening_at(socket_path: &Path) -> io::Result<bool> {
     }
 }
 
+#[cfg(test)]
 fn read_server_status() -> io::Result<Option<crate::api::RuntimeStatus>> {
     crate::api::read_runtime_status_at(&crate::api::socket_path(), STATUS_REQUEST_TIMEOUT)
 }
@@ -152,6 +154,7 @@ fn client_protocol_accepts_hello(socket_path: &Path) -> io::Result<bool> {
     }
 }
 
+#[cfg(test)]
 fn validate_running_server_compatibility(saved_federation: bool) -> io::Result<()> {
     let Some(status) = read_server_status()? else {
         return Err(io::Error::other(format!(
@@ -292,51 +295,171 @@ pub fn wait_for_server_socket(socket_path: &Path, timeout: Duration) -> io::Resu
 // Auto-detect launch
 // ---------------------------------------------------------------------------
 
-/// Performs auto-detect launch: check for server, spawn if needed, then
-/// attach as a thin client.
-///
-/// This is the entry point called from `main.rs` when the user runs `herdr`
-/// without a subcommand.
-///
-/// Flow:
-/// 1. Check if a server is listening on the client socket
-/// 2. If no server → spawn server daemon → wait for socket readiness
-/// 3. Run the thin client (which connects to the server)
+fn temp_tui_socket_dir() -> PathBuf {
+    #[cfg(unix)]
+    {
+        PathBuf::from(format!("/tmp/herdr-tui-{}", std::process::id()))
+    }
+    #[cfg(not(unix))]
+    {
+        std::env::temp_dir().join(format!("herdr-tui-{}", std::process::id()))
+    }
+}
+
+fn prepare_temp_tui_socket_dir(dir: &Path) -> io::Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))?;
+    }
+    Ok(())
+}
+
+struct InprocessEnvGuard {
+    prev_api_socket: Option<std::ffi::OsString>,
+    prev_client_socket: Option<std::ffi::OsString>,
+    prev_startup_cwd: Option<std::ffi::OsString>,
+    temp_dir: PathBuf,
+}
+
+impl Drop for InprocessEnvGuard {
+    fn drop(&mut self) {
+        match &self.prev_api_socket {
+            Some(val) => std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, val),
+            None => std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR),
+        }
+        match &self.prev_client_socket {
+            Some(val) => std::env::set_var(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR, val),
+            None => std::env::remove_var(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR),
+        }
+        match &self.prev_startup_cwd {
+            Some(val) => std::env::set_var(STARTUP_CWD_ENV_VAR, val),
+            None => std::env::remove_var(STARTUP_CWD_ENV_VAR),
+        }
+        let _ = std::fs::remove_dir_all(&self.temp_dir);
+    }
+}
+
+/// Performs auto-detect launch using an in-process `HeadlessServer` backed by
+/// the already-installed `hc` (`herdr-core`) daemon.
 pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
-    // The client requires terminal geometry before it can attach. Reject an
-    // unusable terminal before socket lookup creates directories or starts a daemon.
     crate::platform::terminal_grid_size().map_err(|err| {
         io::Error::new(
             err.kind(),
             format!("cannot attach without a usable terminal: {err}; run inside a terminal"),
         )
     })?;
-    let socket_path = client_socket_path();
-    info!(path = %socket_path.display(), "auto-detect launch starting");
 
-    let startup = is_server_listening().and_then(|listening| {
-        if listening {
-            info!("server already running, attaching as client");
-            if saved_federation {
-                Ok(())
-            } else {
-                validate_running_server_compatibility(false)
+    let hc_session = crate::session::active_name();
+    match crate::hc::core_bin::find(None) {
+        Some(core_bin) => {
+            crate::hc::core_bin::use_core(core_bin);
+            match crate::hc::Core::connect(hc_session.as_deref()) {
+                Ok(core) => {
+                    crate::hc::set_global_core(Some(core));
+                }
+                Err(error) => {
+                    if !saved_federation {
+                        return Err(error);
+                    }
+                    tracing::warn!(%error, "hc connection failed; keeping saved machines available");
+                }
             }
-        } else {
-            info!("no server running, spawning server daemon");
-            spawn_server_daemon()
-                .and_then(|_| wait_for_server_socket(&socket_path, SERVER_READY_TIMEOUT))
         }
-    });
-    if let Err(error) = startup {
-        if !saved_federation {
-            return Err(error);
+        None => {
+            let err = io::Error::new(
+                io::ErrorKind::NotFound,
+                "cannot find `hc` (herdr-core) on this machine; install `hc` or `herdr-app` first, or set HC_BIN",
+            );
+            if !saved_federation {
+                return Err(err);
+            }
+            tracing::warn!(%err, "hc binary not found; keeping saved machines available");
         }
-        tracing::warn!(%error, "Local startup failed; keeping saved machines available");
     }
 
-    // Now attach as a thin client.
-    crate::client::run_client()
+    let temp_dir = temp_tui_socket_dir();
+    prepare_temp_tui_socket_dir(&temp_dir)?;
+    let api_sock = temp_dir.join("herdr.sock");
+    let client_sock = temp_dir.join("herdr-client.sock");
+
+    crate::session::clear_explicit_session_override();
+    let _env_guard = InprocessEnvGuard {
+        prev_api_socket: std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR),
+        prev_client_socket: std::env::var_os(crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR),
+        prev_startup_cwd: std::env::var_os(STARTUP_CWD_ENV_VAR),
+        temp_dir: temp_dir.clone(),
+    };
+    std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &api_sock);
+    std::env::set_var(
+        crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
+        &client_sock,
+    );
+    if std::env::var_os(STARTUP_CWD_ENV_VAR).is_none() {
+        if let Ok(cwd) = std::env::current_dir() {
+            std::env::set_var(STARTUP_CWD_ENV_VAR, cwd);
+        }
+    }
+
+    let server_stop = crate::server::shutdown::ServerStop::default();
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+    let stop_for_thread = server_stop.clone();
+    let server_thread = std::thread::Builder::new()
+        .name("herdr-inprocess-server".into())
+        .spawn(move || {
+            if let Err(err) = crate::server::headless::run_inprocess_server(stop_for_thread, ready_tx)
+            {
+                tracing::error!(err = %err, "in-process headless server exited with error");
+            }
+        })
+        .map_err(io::Error::other)?;
+
+    let render_notify = match ready_rx.recv_timeout(SERVER_READY_TIMEOUT) {
+        Ok(Ok(notify)) => Some(notify),
+        Ok(Err(err)) => {
+            server_stop.request(crate::server::shutdown::ShutdownReason::HostShutdown);
+            let _ = server_thread.join();
+            crate::hc::set_global_core(None);
+            crate::hc::reset_registry();
+            return Err(err);
+        }
+        Err(_) => {
+            server_stop.request(crate::server::shutdown::ShutdownReason::HostShutdown);
+            let _ = server_thread.join();
+            crate::hc::set_global_core(None);
+            crate::hc::reset_registry();
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "timed out waiting for in-process TUI server startup",
+            ));
+        }
+    };
+
+    if let Err(err) = wait_for_server_socket(&client_sock, SERVER_READY_TIMEOUT) {
+        server_stop.request(crate::server::shutdown::ShutdownReason::HostShutdown);
+        if let Some(notify) = &render_notify {
+            notify.notify_one();
+        }
+        let _ = server_thread.join();
+        crate::hc::set_global_core(None);
+        crate::hc::reset_registry();
+        return Err(err);
+    }
+
+    let client_result = crate::client::run_client();
+
+    server_stop.request(crate::server::shutdown::ShutdownReason::ApiStop {
+        caller: Some("in-process TUI client exit".into()),
+    });
+    if let Some(notify) = &render_notify {
+        notify.notify_one();
+    }
+    let _ = server_thread.join();
+    crate::hc::set_global_core(None);
+    crate::hc::reset_registry();
+
+    client_result
 }
 
 // ---------------------------------------------------------------------------

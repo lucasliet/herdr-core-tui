@@ -206,6 +206,14 @@ impl App {
             return self.handle_api_worktree_remove_finished(*result);
         }
 
+        if let AppEvent::HcSync {
+            docs_changed,
+            terminals,
+        } = ev
+        {
+            return crate::hc::sync::handle_hc_sync(self, docs_changed, terminals);
+        }
+
         let mut worktree_restore_updates = Vec::new();
         if let AppEvent::PaneDied { pane_id, .. } = &ev {
             if self

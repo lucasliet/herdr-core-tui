@@ -25,6 +25,7 @@ mod detect;
 mod events;
 use ghostty_vt as ghostty;
 mod handoff_runtime;
+pub(crate) mod hc;
 mod input;
 mod integration;
 mod ipc;
@@ -578,29 +579,10 @@ fn main() -> io::Result<()> {
     }
 
     if args.get(1).map(|s| s.as_str()) == Some("update") {
-        let options = match update::parse_self_update_args(&args[2..]) {
-            Ok(options) => options,
-            Err(err) if err.starts_with("usage:") => {
-                eprintln!("{err}");
-                std::process::exit(0);
-            }
-            Err(err) => {
-                eprintln!("{err}");
-                eprintln!("usage: herdr update [--handoff]");
-                std::process::exit(2);
-            }
-        };
-        match update::self_update(options) {
-            Ok(_) => return Ok(()),
-            Err(e) => {
-                if e.starts_with("self-update is disabled") {
-                    eprintln!("{e}");
-                } else {
-                    eprintln!("update failed: {e}");
-                }
-                std::process::exit(1);
-            }
-        }
+        println!(
+            "herdr-tui runs alongside your existing `hc` / `herdr-app` installation and does not self-update or overwrite `hc`."
+        );
+        return Ok(());
     }
 
     if args.iter().any(|a| a == "--help" || a == "-h") {
