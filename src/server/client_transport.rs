@@ -448,6 +448,12 @@ pub(crate) enum ServerEvent {
         extension: String,
         data: Vec<u8>,
     },
+    /// Async `hc terminal.put` upload completed for a client clipboard image.
+    HcClipboardImageUploaded {
+        client_id: u64,
+        target: crate::protocol::ClientClipboardImageTarget,
+        result: Result<String, String>,
+    },
     /// A client requested direct attach to one terminal.
     ClientAttachTerminal {
         client_id: u64,

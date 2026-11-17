@@ -7526,6 +7526,40 @@ fn oversized_paste_rejection_notifies_only_the_sending_client() {
 }
 
 #[test]
+fn hc_clipboard_image_uploaded_reports_error_to_sender() {
+    let mut server = test_headless_server();
+    let (shell_writer, shell_control_rx, _shell_render_rx) = test_client_writer();
+    server.clients.insert(
+        7,
+        ClientConnection::new_with_mode(
+            ClientConnectionMode::ClientShell,
+            (100, 30),
+            crate::kitty_graphics::HostCellSize::default(),
+            7,
+            RenderEncoding::SemanticFrame,
+            Some(shell_writer),
+        ),
+    );
+    assert!(
+        !server.handle_server_event(ServerEvent::HcClipboardImageUploaded {
+            client_id: 7,
+            target: crate::protocol::ClientClipboardImageTarget::Pane("w1:p1".to_owned()),
+            result: Err("remote disconnected".to_owned()),
+        })
+    );
+    match read_server_message(
+        shell_control_rx
+            .recv_timeout(Duration::from_millis(100))
+            .expect("client shell upload error"),
+    ) {
+        ServerMessage::ClientShellError { message } => {
+            assert_eq!(message, "Remote image upload failed: remote disconnected");
+        }
+        other => panic!("expected ClientShellError, got {other:?}"),
+    }
+}
+
+#[test]
 fn update_notification_reaches_client_shell_independent_of_delivery() {
     let mut server = test_headless_server();
     let (client_tx, client_control_rx, _client_rx) = test_client_writer();

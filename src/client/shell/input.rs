@@ -1091,6 +1091,20 @@ impl ClientShellState {
             .and_then(|snapshot| snapshot.focused_pane_id.clone())
     }
 
+    pub(crate) fn focused_workspace_is_remote_machine(&self) -> bool {
+        let Some(snapshot) = self.snapshot.as_deref() else {
+            return false;
+        };
+        let Some(focused_id) = snapshot.focused_workspace_id.as_deref() else {
+            return false;
+        };
+        snapshot
+            .workspaces
+            .iter()
+            .find(|ws| ws.workspace_id == focused_id)
+            .is_some_and(|ws| ws.machine.is_some())
+    }
+
     pub(crate) fn clipboard_image_target(
         &self,
     ) -> Option<crate::protocol::ClientClipboardImageTarget> {

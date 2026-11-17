@@ -31,6 +31,19 @@ fn clipboard_image_targets_the_focused_pane_or_active_popup() {
 }
 
 #[test]
+fn focused_workspace_is_remote_machine_detects_hc_machine_workspaces() {
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
+    let mut snap = snapshot();
+    assert!(!state.focused_workspace_is_remote_machine());
+    state.set_snapshot(Box::new(snap.clone()));
+    assert!(!state.focused_workspace_is_remote_machine());
+
+    snap.workspaces[0].machine = Some("desk-local".into());
+    state.set_snapshot(Box::new(snap));
+    assert!(state.focused_workspace_is_remote_machine());
+}
+
+#[test]
 fn modal_paste_target_requires_a_focused_editable_client_field() {
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&Config::default()));
     assert!(!state.modal_paste_target_active());

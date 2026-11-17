@@ -55,7 +55,7 @@ pub(crate) fn remove_files(paths: Vec<PathBuf>) {
     }
 }
 
-fn sanitize_extension(extension: &str) -> &'static str {
+pub(crate) fn sanitize_extension(extension: &str) -> &'static str {
     if extension.eq_ignore_ascii_case("png") {
         "png"
     } else if extension.eq_ignore_ascii_case("jpg") || extension.eq_ignore_ascii_case("jpeg") {

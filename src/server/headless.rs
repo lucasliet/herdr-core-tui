@@ -1155,6 +1155,48 @@ impl HeadlessServer {
         }
     }
 
+    fn send_clipboard_image_error(&mut self, client_id: u64, detail: String) {
+        let message = if matches!(
+            self.clients.get(&client_id).map(|client| &client.mode),
+            Some(ClientConnectionMode::ClientShell)
+        ) {
+            ServerMessage::ClientShellError { message: detail }
+        } else {
+            ServerMessage::Notify {
+                kind: protocol::NotifyKind::Toast,
+                message: "Image paste failed".to_owned(),
+                body: Some(detail),
+            }
+        };
+        self.send_to_client(client_id, message);
+    }
+
+    fn resolve_hc_put_target(
+        &self,
+        client_id: u64,
+        target: &protocol::ClientClipboardImageTarget,
+    ) -> Option<(Arc<crate::hc::client::Core>, String)> {
+        let core = crate::hc::global_core()?;
+        let pane_id = match target {
+            protocol::ClientClipboardImageTarget::DirectTerminal => {
+                let ClientConnection {
+                    mode: ClientConnectionMode::TerminalAttach { terminal_id },
+                    ..
+                } = self.clients.get(&client_id)?
+                else {
+                    return None;
+                };
+                self.app.parse_pane_id(terminal_id).map(|(_, id)| id)?
+            }
+            protocol::ClientClipboardImageTarget::Pane(pane_id) => {
+                self.app.parse_pane_id(pane_id).map(|(_, id)| id)?
+            }
+            protocol::ClientClipboardImageTarget::Popup(_) => return None,
+        };
+        let addr = crate::hc::client::pane_address(pane_id)?;
+        (addr.contains('/') || core.is_remote()).then_some((core, addr))
+    }
+
     fn stage_client_clipboard_image(
         &self,
         client_id: u64,
@@ -2143,6 +2185,44 @@ impl HeadlessServer {
                 if !self.client_clipboard_image_target_is_valid(client_id, &target) {
                     return false;
                 }
+                if let Some((core, addr)) = self.resolve_hc_put_target(client_id, &target) {
+                    if data.len() > crate::hc::client::HC_MAX_PUT_BYTES {
+                        self.send_clipboard_image_error(
+                            client_id,
+                            format!(
+                                "Image too large ({} bytes); remote hc limit is {} bytes",
+                                data.len(),
+                                crate::hc::client::HC_MAX_PUT_BYTES
+                            ),
+                        );
+                        return false;
+                    }
+                    if !core.supports_method("terminal.put") {
+                        self.send_clipboard_image_error(
+                            client_id,
+                            "Remote hc daemon does not support terminal.put".to_owned(),
+                        );
+                        return false;
+                    }
+                    let ext = crate::server::clipboard_image::sanitize_extension(&extension);
+                    let unique = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    let filename = format!("clipboard-{client_id}-{unique}.{ext}");
+                    let tx = self.server_event_tx.clone();
+                    let _ = crate::thread_spawn::spawn_named("hc-terminal-put", move || {
+                        let result = core
+                            .put_terminal_file(&addr, &filename, &data)
+                            .map_err(|err| err.to_string());
+                        let _ = tx.blocking_send(ServerEvent::HcClipboardImageUploaded {
+                            client_id,
+                            target,
+                            result,
+                        });
+                    });
+                    return false;
+                }
                 match self.stage_client_clipboard_image(client_id, &extension, &data) {
                     Ok(staged) => {
                         let routed = self.paste_client_clipboard_image_path(
@@ -2164,10 +2244,31 @@ impl HeadlessServer {
                     }
                     Err(err) => {
                         warn!(client_id, err = %err, "failed to stage client clipboard image");
-                        true
+                        self.send_clipboard_image_error(
+                            client_id,
+                            format!("Image paste failed: {err}"),
+                        );
+                        false
                     }
                 }
             }
+            ServerEvent::HcClipboardImageUploaded {
+                client_id,
+                target,
+                result,
+            } => match result {
+                Ok(remote_path) => {
+                    self.paste_client_clipboard_image_path(client_id, target, remote_path)
+                }
+                Err(err) => {
+                    warn!(client_id, err = %err, "hc terminal.put clipboard image upload failed");
+                    self.send_clipboard_image_error(
+                        client_id,
+                        format!("Remote image upload failed: {err}"),
+                    );
+                    false
+                }
+            },
             ServerEvent::ClientResize {
                 client_id,
                 cols,

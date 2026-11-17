@@ -9,6 +9,30 @@ use crate::protocol::{ClientClipboardImageTarget, ClientMessage};
 
 use super::{write_to_server, ClientError};
 
+pub(super) fn write_remote_image_with_notice(
+    stream: &mut impl super::ClientMessageSink,
+    target: ClientClipboardImageTarget,
+    image: crate::platform::ClipboardImage,
+    source: &'static str,
+) -> Result<Option<String>, ClientError> {
+    if image.bytes.len() > MAX_CLIPBOARD_IMAGE_PAYLOAD {
+        let msg = format!(
+            "Image too large to bridge ({} bytes; limit is {} bytes)",
+            image.bytes.len(),
+            MAX_CLIPBOARD_IMAGE_PAYLOAD
+        );
+        warn!(
+            bytes = image.bytes.len(),
+            max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
+            source,
+            "local image is too large to bridge"
+        );
+        return Ok(Some(msg));
+    }
+    write_remote_image_to_server(stream, target, image, source)?;
+    Ok(None)
+}
+
 pub(super) fn write_remote_image_to_server(
     stream: &mut impl super::ClientMessageSink,
     target: ClientClipboardImageTarget,
@@ -54,12 +78,27 @@ pub(super) fn client_remote_image_paste_key(
     }
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn endpoint_accepts_local_images(
     remote_client_process: bool,
     endpoint_id: &super::endpoint::ClientEndpointId,
     active_surface_available: bool,
 ) -> bool {
     active_surface_available && (remote_client_process || !endpoint_id.is_local())
+}
+
+pub(super) fn client_image_bridge_active(
+    remote_client_process: bool,
+    ssh_session: bool,
+    endpoint_id: &super::endpoint::ClientEndpointId,
+    active_surface_available: bool,
+    focused_remote_machine: bool,
+) -> bool {
+    active_surface_available
+        && (remote_client_process
+            || ssh_session
+            || focused_remote_machine
+            || !endpoint_id.is_local())
 }
 
 #[cfg(unix)]
@@ -120,52 +159,94 @@ pub(super) fn should_bridge_clipboard_image_events(
 }
 
 #[cfg(unix)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn read_image_file_from_terminal_drop(
     data: &[u8],
     is_remote_client: bool,
 ) -> Option<crate::platform::ClipboardImage> {
-    let (path, extension) = image_path_from_terminal_drop(data, is_remote_client)?;
-    read_image_file(path, extension)
+    read_image_file_drop_result(data, is_remote_client)
+        .ok()
+        .flatten()
+}
+
+#[cfg(unix)]
+pub(super) fn read_image_file_drop_result(
+    data: &[u8],
+    is_remote_client: bool,
+) -> Result<Option<crate::platform::ClipboardImage>, String> {
+    let Some((path, extension)) = image_path_from_terminal_drop(data, is_remote_client) else {
+        return Ok(None);
+    };
+    read_image_file_result(path, extension)
 }
 
 #[cfg(windows)]
+#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn read_image_file_from_client_events(
     events: &[ClientInputEvent],
     is_remote_client: bool,
 ) -> Option<crate::platform::ClipboardImage> {
-    let [ClientInputEvent::Paste { text }] = events else {
-        return None;
-    };
-    let text = normalized_terminal_drop_text(text)?;
-    let (path, extension) =
-        image_path_from_drop_text(strip_matching_path_quotes(text), is_remote_client)?;
-    read_image_file(path, extension)
+    read_image_file_events_result(events, is_remote_client)
+        .ok()
+        .flatten()
 }
 
-fn read_image_file(
+#[cfg(windows)]
+pub(super) fn read_image_file_events_result(
+    events: &[ClientInputEvent],
+    is_remote_client: bool,
+) -> Result<Option<crate::platform::ClipboardImage>, String> {
+    let [ClientInputEvent::Paste { text }] = events else {
+        return Ok(None);
+    };
+    let Some(text) = normalized_terminal_drop_text(text) else {
+        return Ok(None);
+    };
+    let Some((path, extension)) =
+        image_path_from_drop_text(strip_matching_path_quotes(text), is_remote_client)
+    else {
+        return Ok(None);
+    };
+    read_image_file_result(path, extension)
+}
+
+fn read_image_file_result(
     path: PathBuf,
     extension: &'static str,
-) -> Option<crate::platform::ClipboardImage> {
-    let metadata = std::fs::metadata(&path).ok()?;
+) -> Result<Option<crate::platform::ClipboardImage>, String> {
+    let Ok(metadata) = std::fs::metadata(&path) else {
+        return Ok(None);
+    };
     if !metadata.is_file() {
-        return None;
+        return Ok(None);
     }
 
-    let file = std::fs::File::open(&path).ok()?;
-    let bytes =
-        match crate::platform::read_limited_reader(file, MAX_CLIPBOARD_IMAGE_PAYLOAD).ok()? {
-            crate::platform::LimitedRead::Complete(bytes) => bytes,
-            crate::platform::LimitedRead::Empty => return None,
-            crate::platform::LimitedRead::Oversized => {
-                warn!(
-                    max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
-                    "local image file drop is too large to bridge"
-                );
-                return None;
-            }
-        };
+    let file = std::fs::File::open(&path)
+        .map_err(|err| format!("Failed to read dropped image {}: {err}", path.display()))?;
+    let bytes = match crate::platform::read_limited_reader(file, MAX_CLIPBOARD_IMAGE_PAYLOAD) {
+        Ok(crate::platform::LimitedRead::Complete(bytes)) => bytes,
+        Ok(crate::platform::LimitedRead::Empty) => {
+            return Err(format!("Dropped image is empty: {}", path.display()));
+        }
+        Ok(crate::platform::LimitedRead::Oversized) => {
+            warn!(
+                max = MAX_CLIPBOARD_IMAGE_PAYLOAD,
+                "local image file drop is too large to bridge"
+            );
+            return Err(format!(
+                "Dropped image exceeds the {} byte bridge limit",
+                MAX_CLIPBOARD_IMAGE_PAYLOAD
+            ));
+        }
+        Err(err) => {
+            return Err(format!(
+                "Failed to read dropped image {}: {err}",
+                path.display()
+            ));
+        }
+    };
 
-    Some(crate::platform::ClipboardImage { bytes, extension })
+    Ok(Some(crate::platform::ClipboardImage { bytes, extension }))
 }
 
 #[cfg(unix)]

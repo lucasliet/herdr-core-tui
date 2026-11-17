@@ -79,6 +79,16 @@ use terminal_setup::{
     setup_direct_attach_terminal, setup_terminal, should_draw_host_cursor, TerminalGuard,
 };
 
+fn present_shell_error(state: &mut ClientState, message: String) {
+    if let Some(shell) = state.shell.as_mut() {
+        if shell.receive_endpoint_error(message) {
+            if let Some(frame) = shell.compose(state.reported_size.0, state.reported_size.1) {
+                state.present_frame(frame);
+            }
+        }
+    }
+}
+
 fn refresh_host_mouse_capture(enabled: bool, sgr_pixels: bool) {
     if let Err(err) = set_mouse_capture(enabled, sgr_pixels) {
         warn!(err = %err, "failed to re-assert host mouse capture");
@@ -114,12 +124,14 @@ use attach::AttachEscapeState;
 #[cfg(unix)]
 use attach::{write_attach_semantic_action, AttachInputAction};
 use clipboard_images::{
-    client_remote_image_paste_key, endpoint_accepts_local_images, write_remote_image_to_server,
+    client_image_bridge_active, client_remote_image_paste_key, write_remote_image_with_notice,
 };
-#[cfg(windows)]
-use clipboard_images::{read_image_file_from_client_events, should_bridge_clipboard_image_events};
+#[cfg(test)]
+use clipboard_images::{endpoint_accepts_local_images, read_image_file_from_terminal_drop};
 #[cfg(unix)]
-use clipboard_images::{read_image_file_from_terminal_drop, should_bridge_clipboard_image_paste};
+use clipboard_images::{read_image_file_drop_result, should_bridge_clipboard_image_paste};
+#[cfg(windows)]
+use clipboard_images::{read_image_file_events_result, should_bridge_clipboard_image_events};
 pub use errors::ClientError;
 #[cfg(test)]
 use frame_output::{clear_received_kitty_graphics, kitty_graphics_image_ids};
@@ -850,11 +862,7 @@ async fn run_client_loop(
             ClientLoopEvent::EndpointCatalog(reload) => pending_catalog = Some(reload),
             #[cfg(unix)]
             ClientLoopEvent::StdinInput(data) => {
-                let image_bridge_active = endpoint_accepts_local_images(
-                    is_remote_client,
-                    write_stream.active_id(),
-                    write_stream.active_surface_available(),
-                );
+                let ssh_session = terminal_setup::is_ssh_session();
                 if state.shell.is_some() {
                     if will_query_host_cell_size {
                         let events = crate::raw_input::parse_framed_input(&data);
@@ -868,34 +876,59 @@ async fn run_client_loop(
                         .as_ref()
                         .and_then(|shell| shell.clipboard_image_target());
                     if let Some(target) = image_target.clone() {
+                        let focused_remote =
+                            matches!(target, crate::protocol::ClientClipboardImageTarget::Pane(_))
+                                && state.shell.as_ref().is_some_and(|shell| {
+                                    shell.focused_workspace_is_remote_machine()
+                                });
+                        let shell_bridge_active = client_image_bridge_active(
+                            is_remote_client,
+                            ssh_session,
+                            write_stream.active_id(),
+                            write_stream.active_surface_available(),
+                            focused_remote,
+                        );
                         if should_bridge_clipboard_image_paste(
                             &data,
-                            image_bridge_active,
+                            shell_bridge_active,
                             state.remote_image_paste_key,
                         ) {
                             if let Some(image) = crate::platform::read_clipboard_image() {
-                                write_remote_image_to_server(
+                                if let Some(notice) = write_remote_image_with_notice(
                                     &mut write_stream,
                                     target,
                                     image,
                                     "clipboard paste",
-                                )?;
+                                )? {
+                                    present_shell_error(&mut state, notice);
+                                }
+                                continue;
+                            }
+                            if data == b"\x1b[200~\x1b[201~" {
+                                present_shell_error(&mut state, "No image in clipboard".to_owned());
                                 continue;
                             }
                             info!(
                                 "clipboard image paste trigger received, but local clipboard has no image"
                             );
                         }
-                        if let Some(image) =
-                            read_image_file_from_terminal_drop(&data, image_bridge_active)
-                        {
-                            write_remote_image_to_server(
-                                &mut write_stream,
-                                target,
-                                image,
-                                "file drop",
-                            )?;
-                            continue;
+                        match read_image_file_drop_result(&data, shell_bridge_active) {
+                            Ok(Some(image)) => {
+                                if let Some(notice) = write_remote_image_with_notice(
+                                    &mut write_stream,
+                                    target,
+                                    image,
+                                    "file drop",
+                                )? {
+                                    present_shell_error(&mut state, notice);
+                                }
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(notice) => {
+                                present_shell_error(&mut state, notice);
+                                continue;
+                            }
                         }
                     }
                     let events = crate::raw_input::parse_framed_input(&data);
@@ -1007,13 +1040,20 @@ async fn run_client_loop(
                     }
                     data
                 };
+                let direct_bridge_active = client_image_bridge_active(
+                    is_remote_client,
+                    ssh_session,
+                    write_stream.active_id(),
+                    write_stream.active_surface_available(),
+                    false,
+                );
                 if should_bridge_clipboard_image_paste(
                     &data,
-                    image_bridge_active,
+                    direct_bridge_active,
                     state.remote_image_paste_key,
                 ) {
                     if let Some(image) = crate::platform::read_clipboard_image() {
-                        write_remote_image_to_server(
+                        let _ = write_remote_image_with_notice(
                             &mut write_stream,
                             crate::protocol::ClientClipboardImageTarget::DirectTerminal,
                             image,
@@ -1025,9 +1065,8 @@ async fn run_client_loop(
                         "clipboard image paste trigger received, but local clipboard has no image"
                     );
                 }
-                if let Some(image) = read_image_file_from_terminal_drop(&data, image_bridge_active)
-                {
-                    write_remote_image_to_server(
+                if let Ok(Some(image)) = read_image_file_drop_result(&data, direct_bridge_active) {
+                    let _ = write_remote_image_with_notice(
                         &mut write_stream,
                         crate::protocol::ClientClipboardImageTarget::DirectTerminal,
                         image,
@@ -1169,11 +1208,7 @@ async fn run_client_loop(
             }
             #[cfg(windows)]
             ClientLoopEvent::StdinEvents(events) => {
-                let image_bridge_active = endpoint_accepts_local_images(
-                    is_remote_client,
-                    write_stream.active_id(),
-                    write_stream.active_surface_available(),
-                );
+                let ssh_session = terminal_setup::is_ssh_session();
                 if state.shell.is_some() {
                     if events.iter().any(|event| {
                         matches!(event, crate::protocol::ClientInputEvent::FocusGained)
@@ -1193,34 +1228,62 @@ async fn run_client_loop(
                         .as_ref()
                         .and_then(|shell| shell.clipboard_image_target());
                     if let Some(target) = image_target.clone() {
+                        let focused_remote =
+                            matches!(target, crate::protocol::ClientClipboardImageTarget::Pane(_))
+                                && state.shell.as_ref().is_some_and(|shell| {
+                                    shell.focused_workspace_is_remote_machine()
+                                });
+                        let shell_bridge_active = client_image_bridge_active(
+                            is_remote_client,
+                            ssh_session,
+                            write_stream.active_id(),
+                            write_stream.active_surface_available(),
+                            focused_remote,
+                        );
                         if should_bridge_clipboard_image_events(
                             &events,
-                            image_bridge_active,
+                            shell_bridge_active,
                             state.remote_image_paste_key,
                         ) {
                             if let Some(image) = crate::platform::read_clipboard_image() {
-                                write_remote_image_to_server(
+                                if let Some(notice) = write_remote_image_with_notice(
                                     &mut write_stream,
                                     target,
                                     image,
                                     "clipboard paste",
-                                )?;
+                                )? {
+                                    present_shell_error(&mut state, notice);
+                                }
+                                continue;
+                            }
+                            if matches!(
+                                events.as_slice(),
+                                [crate::protocol::ClientInputEvent::Paste { text }] if text.is_empty()
+                            ) {
+                                present_shell_error(&mut state, "No image in clipboard".to_owned());
                                 continue;
                             }
                             info!(
                                 "clipboard image paste trigger received, but local clipboard has no image"
                             );
                         }
-                        if let Some(image) =
-                            read_image_file_from_client_events(&events, image_bridge_active)
-                        {
-                            write_remote_image_to_server(
-                                &mut write_stream,
-                                target,
-                                image,
-                                "file drop",
-                            )?;
-                            continue;
+                        match read_image_file_events_result(&events, shell_bridge_active) {
+                            Ok(Some(image)) => {
+                                if let Some(notice) = write_remote_image_with_notice(
+                                    &mut write_stream,
+                                    target,
+                                    image,
+                                    "file drop",
+                                )? {
+                                    present_shell_error(&mut state, notice);
+                                }
+                                continue;
+                            }
+                            Ok(None) => {}
+                            Err(notice) => {
+                                present_shell_error(&mut state, notice);
+                                continue;
+                            }
                         }
                     }
                     let (outcome, frame) = {

@@ -297,6 +297,23 @@ fn image_bridge_follows_the_selected_remote_endpoint() {
     assert!(!endpoint_accepts_local_images(false, &remote, false));
 }
 
+#[test]
+fn client_image_bridge_activates_for_ssh_and_focused_remote_machine() {
+    let local = crate::client::endpoint::ClientEndpointId::Local;
+    assert!(!clipboard_images::client_image_bridge_active(
+        false, false, &local, true, false
+    ));
+    assert!(clipboard_images::client_image_bridge_active(
+        false, true, &local, true, false
+    ));
+    assert!(clipboard_images::client_image_bridge_active(
+        false, false, &local, true, true
+    ));
+    assert!(!clipboard_images::client_image_bridge_active(
+        false, true, &local, false, true
+    ));
+}
+
 #[cfg(unix)]
 #[test]
 fn clipboard_image_paste_bridge_triggers_on_configured_key_and_empty_paste() {
