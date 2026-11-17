@@ -782,22 +782,30 @@ fn main() -> io::Result<()> {
         }
     }
 
+    let loaded_config = config::Config::load();
+    exit_if_nested_disabled(&loaded_config.config);
+
     if let Some(remote_launch) = remote_launch {
-        let remote_target = remote_launch.target.clone();
-        if let Err(err) = remote::run_remote(remote_launch) {
-            eprintln!("error: {err}");
-            remote::print_remote_error_hint(&err, &remote_target);
+        if std::env::var_os("HERDR_LEGACY_REMOTE").is_some() {
+            let remote_target = remote_launch.target.clone();
+            if let Err(err) = remote::run_remote(remote_launch) {
+                eprintln!("error: {err}");
+                remote::print_remote_error_hint(&err, &remote_target);
+                std::process::exit(1);
+            }
+            return Ok(());
+        }
+        if let Err(err) = server::autodetect::auto_detect_launch(false, Some(&remote_launch.target))
+        {
+            eprintln!("herdr-core-tui: {err}");
             std::process::exit(1);
         }
         return Ok(());
     }
 
-    let loaded_config = config::Config::load();
-    exit_if_nested_disabled(&loaded_config.config);
-
     let saved_federation =
         client::endpoint::EndpointCatalog::load().is_ok_and(|catalog| catalog.has_enabled_ssh());
-    if let Err(err) = server::autodetect::auto_detect_launch(saved_federation) {
+    if let Err(err) = server::autodetect::auto_detect_launch(saved_federation, None) {
         eprintln!("herdr: {err}");
         std::process::exit(1);
     }

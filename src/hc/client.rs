@@ -1,10 +1,12 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::time::Duration;
 
+use base64::Engine as _;
 use serde_json::{json, Value};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 
@@ -283,8 +285,13 @@ pub fn check_hello(hello: &Value) -> Result<(), Mismatch> {
     }
 }
 
+pub const HC_MAX_PUT_BYTES: usize = 8 * 1024 * 1024;
+pub const HC_REMOTE_CLIENT_ENV: &str = "HERDR_HC_REMOTE_CLIENT";
+
 pub struct Core {
     pub hello: Value,
+    ssh_target: Option<String>,
+    local_socket: Option<PathBuf>,
     writer: mpsc::Sender<Vec<u8>>,
     routes: Arc<Mutex<Routes>>,
     next_id: AtomicU64,
@@ -339,6 +346,103 @@ fn connect_error(stderr: &str) -> Option<String> {
     )
 }
 
+fn posix_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn resolve_local_hc_socket(session: Option<&str>) -> Option<PathBuf> {
+    if let Some(socket) = std::env::var_os("HC_SOCKET").filter(|v| !v.is_empty()) {
+        return Some(PathBuf::from(socket));
+    }
+    let session_name = session
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+        .or_else(|| std::env::var("HC_SESSION").ok().filter(|s| !s.is_empty()))
+        .unwrap_or_else(|| "default".to_owned());
+    let state_base = std::env::var_os("XDG_STATE_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .or_else(|| std::env::var_os("USERPROFILE"))
+                .filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".local/state"))
+        })?;
+    Some(
+        state_base
+            .join("herdr-core")
+            .join(&session_name)
+            .join(format!("{session_name}.sock")),
+    )
+}
+
+fn remote_ssh_control_dir() -> Option<PathBuf> {
+    #[cfg(unix)]
+    {
+        let base = std::env::var_os("XDG_RUNTIME_DIR")
+            .filter(|v| !v.is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| {
+                let uid = unsafe { libc::geteuid() };
+                PathBuf::from(format!("/tmp/herdr-core-tui-ssh-{uid}"))
+            });
+        let dir = if base
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.starts_with("herdr-core-tui-ssh"))
+        {
+            base
+        } else {
+            base.join("herdr-core-tui-ssh")
+        };
+        if std::fs::create_dir_all(&dir).is_ok() {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            return Some(dir);
+        }
+        None
+    }
+    #[cfg(not(unix))]
+    {
+        None
+    }
+}
+
+pub(crate) fn remote_ssh_args(
+    target: &str,
+    session: Option<&str>,
+    control_dir: Option<&Path>,
+) -> Vec<String> {
+    let mut args = vec![
+        "-T".to_owned(),
+        "-o".to_owned(),
+        "BatchMode=yes".to_owned(),
+        "-o".to_owned(),
+        "ExitOnForwardFailure=yes".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveInterval=15".to_owned(),
+        "-o".to_owned(),
+        "ServerAliveCountMax=3".to_owned(),
+    ];
+    if let Some(dir) = control_dir {
+        args.push("-o".to_owned());
+        args.push("ControlMaster=auto".to_owned());
+        args.push("-o".to_owned());
+        args.push("ControlPersist=600".to_owned());
+        args.push("-o".to_owned());
+        args.push(format!("ControlPath={}/ctl-%C", dir.display()));
+    }
+    args.push("--".to_owned());
+    args.push(target.to_owned());
+    let mut remote_cmd = "hc connect".to_owned();
+    if let Some(session) = session.filter(|s| !s.is_empty()) {
+        remote_cmd.push_str(" --session ");
+        remote_cmd.push_str(&posix_quote(session));
+    }
+    args.push(remote_cmd);
+    args
+}
+
 impl Core {
     pub fn connect(session: Option<&str>) -> io::Result<Arc<Core>> {
         let mut cmd = Command::new(super::core_bin::path());
@@ -346,17 +450,39 @@ impl Core {
         if let Some(session) = session.filter(|s| !s.is_empty()) {
             cmd.args(["--session", session]);
         }
+        let local_socket = resolve_local_hc_socket(session);
+        Self::spawn_command(
+            cmd,
+            None,
+            local_socket,
+            "cannot run `hc connect`: is herdr-core installed?",
+        )
+    }
+
+    pub fn connect_remote(target: &str, session: Option<&str>) -> io::Result<Arc<Core>> {
+        let mut cmd = Command::new("ssh");
+        let control_dir = remote_ssh_control_dir();
+        cmd.args(remote_ssh_args(target, session, control_dir.as_deref()));
+        Self::spawn_command(
+            cmd,
+            Some(target.to_owned()),
+            None,
+            &format!("cannot start ssh to `{target}` for `hc connect`"),
+        )
+    }
+
+    fn spawn_command(
+        mut cmd: Command,
+        ssh_target: Option<String>,
+        local_socket: Option<PathBuf>,
+        spawn_context: &str,
+    ) -> io::Result<Arc<Core>> {
         let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .spawn()
-            .map_err(|err| {
-                io::Error::new(
-                    err.kind(),
-                    format!("cannot run `hc connect`: is herdr-core installed? ({err})"),
-                )
-            })?;
+            .map_err(|err| io::Error::new(err.kind(), format!("{spawn_context} ({err})")))?;
 
         let mut stderr = child
             .stderr
@@ -441,6 +567,8 @@ impl Core {
         let (lost_tx, _) = tokio::sync::broadcast::channel::<()>(1);
         let core = Arc::new(Core {
             hello: hello_value,
+            ssh_target,
+            local_socket,
             writer,
             routes: routes.clone(),
             next_id: AtomicU64::new(1),
@@ -615,6 +743,121 @@ impl Core {
         )
     }
 
+    pub fn is_remote(&self) -> bool {
+        self.ssh_target.is_some()
+    }
+
+    pub fn supports_method(&self, method: &str) -> bool {
+        self.hello
+            .get("methods")
+            .and_then(Value::as_array)
+            .is_some_and(|methods| methods.iter().any(|entry| entry.as_str() == Some(method)))
+    }
+
+    pub fn supports_feature(&self, feature: &str) -> bool {
+        self.hello
+            .get("features")
+            .and_then(Value::as_array)
+            .is_some_and(|features| features.iter().any(|entry| entry.as_str() == Some(feature)))
+    }
+
+    pub fn self_caller(&self) -> Option<String> {
+        if self.is_remote() {
+            return None;
+        }
+        let term_socket = std::env::var_os("HC_TERMINAL_SOCKET").filter(|v| !v.is_empty())?;
+        let term_id = std::env::var("HC_TERMINAL_ID")
+            .ok()
+            .filter(|v| !v.is_empty())?;
+        let expected = self.local_socket.as_deref()?;
+        let term_path = Path::new(&term_socket);
+        let matches = term_path == expected
+            || (term_path
+                .canonicalize()
+                .ok()
+                .is_some_and(|a| expected.canonicalize().ok().is_some_and(|b| a == b)));
+        matches.then_some(term_id)
+    }
+
+    pub fn put_terminal_file(&self, terminal: &str, name: &str, data: &[u8]) -> io::Result<String> {
+        if data.len() > HC_MAX_PUT_BYTES {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "image is too large for hc terminal.put ({} bytes > {} bytes limit)",
+                    data.len(),
+                    HC_MAX_PUT_BYTES
+                ),
+            ));
+        }
+        let encoded = base64::engine::general_purpose::STANDARD.encode(data);
+        let result = self.call_timeout(
+            "terminal.put",
+            json!({
+                "terminal": terminal,
+                "name": name,
+                "data": encoded,
+            }),
+            Duration::from_secs(20),
+        )?;
+        result
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other(format!("terminal.put returned no path: {result}")))
+    }
+
+    pub fn exec_machine(
+        &self,
+        machine: Option<&str>,
+        argv: &[&str],
+        timeout_ms: u64,
+    ) -> io::Result<String> {
+        let mut params = json!({
+            "argv": argv,
+            "timeout": timeout_ms,
+        });
+        if let Some(m) = machine {
+            params["on"] = json!(m);
+        }
+        let result = self.call_timeout(
+            "machine.exec",
+            params,
+            Duration::from_millis(timeout_ms.saturating_add(2_000)),
+        )?;
+        let stdout_b64 = result
+            .get("stdout")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(stdout_b64)
+            .map_err(|err| {
+                io::Error::other(format!("invalid base64 stdout from machine.exec: {err}"))
+            })?;
+        Ok(String::from_utf8_lossy(&bytes).into_owned())
+    }
+
+    pub fn read_remote_file(
+        &self,
+        machine: Option<&str>,
+        path: &str,
+        cwd: Option<&str>,
+    ) -> io::Result<String> {
+        let mut params = json!({ "path": path });
+        if let Some(m) = machine {
+            params["on"] = json!(m);
+        }
+        if let Some(cwd) = cwd {
+            params["cwd"] = json!(cwd);
+        }
+        let result = self.call_timeout("file.read", params, Duration::from_secs(5))?;
+        result
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .ok_or_else(|| io::Error::other("file.read returned no text"))
+    }
+
     #[allow(dead_code)] // Retained for herdr-core RPC parity.
     pub fn keep_terminal(&self, terminal: &str, off: bool) -> io::Result<Value> {
         self.call("terminal.keep", json!({ "terminal": terminal, "off": off }))
@@ -644,16 +887,17 @@ impl Core {
         rows: u16,
         display: Value,
     ) -> io::Result<Attached> {
-        let result = self.call(
-            "terminal.attach",
-            json!({
-                "terminal": terminal,
-                "cols": cols,
-                "rows": rows,
-                "history": 2000,
-                "display": display
-            }),
-        )?;
+        let mut params = json!({
+            "terminal": terminal,
+            "cols": cols,
+            "rows": rows,
+            "history": 2000,
+            "display": display
+        });
+        if let Some(caller) = self.self_caller() {
+            params["caller"] = json!(caller);
+        }
+        let result = self.call("terminal.attach", params)?;
         let channel = result["channel"]
             .as_u64()
             .ok_or_else(|| io::Error::other("attach returned no channel"))?
@@ -781,6 +1025,8 @@ struct HcRegistry {
     last_written_versions_by_machine: HashMap<Option<String>, u64>,
     known_space_ids_by_machine: HashMap<Option<String>, HashSet<String>>,
     known_tab_ids_by_machine: HashMap<Option<String>, HashSet<String>>,
+    terminal_turns: HashMap<String, (u64, u64)>,
+    waiting_addresses: HashSet<String>,
 }
 
 static REGISTRY: OnceLock<Mutex<HcRegistry>> = OnceLock::new();
@@ -1093,6 +1339,55 @@ pub fn tracked_doc_machines() -> Vec<Option<String>> {
     out.into_iter().collect()
 }
 
+pub fn record_terminal_turn(address: &str, turn: u64, seen: u64) -> Option<(u64, u64)> {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .terminal_turns
+        .insert(address.to_owned(), (turn, seen))
+}
+
+pub fn terminal_turn_and_seen(address: &str) -> (u64, u64) {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .terminal_turns
+        .get(address)
+        .copied()
+        .unwrap_or((0, 0))
+}
+
+pub fn mark_terminal_seen_locally(address: &str, seen: u64) {
+    let mut reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    let entry = reg
+        .terminal_turns
+        .entry(address.to_owned())
+        .or_insert((0, 0));
+    entry.1 = entry.1.max(seen);
+}
+
+pub fn set_waiting_addresses(addresses: HashSet<String>) {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .waiting_addresses = addresses;
+}
+
+pub fn is_address_waiting(address: &str) -> bool {
+    registry()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .waiting_addresses
+        .contains(address)
+}
+
+pub fn is_pane_waiting(pane_id: PaneId) -> bool {
+    let reg = registry().lock().unwrap_or_else(|p| p.into_inner());
+    reg.pane_to_addr
+        .get(&pane_id)
+        .is_some_and(|addr| reg.waiting_addresses.contains(addr))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1130,5 +1425,19 @@ mod tests {
         assert_eq!(ch, 42);
         assert_eq!(kind, DATA);
         assert_eq!(decoded, payload);
+    }
+
+    #[test]
+    fn remote_ssh_args_include_control_master_and_quoted_session() {
+        let dir = Path::new("/tmp/hc-ssh-test");
+        let args = remote_ssh_args("dev-box", Some("work'1"), Some(dir));
+        assert!(args.windows(2).any(|w| w == ["-o", "BatchMode=yes"]));
+        assert!(args
+            .windows(2)
+            .any(|w| w == ["-o", "ControlPath=/tmp/hc-ssh-test/ctl-%C"]));
+        assert_eq!(
+            args.last().map(String::as_str),
+            Some("hc connect --session 'work'\"'\"'1'")
+        );
     }
 }

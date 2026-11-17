@@ -553,7 +553,9 @@ fn enable_windows_virtual_terminal_input_inner() -> WindowsVirtualTerminalInputS
 }
 
 pub(super) fn is_ssh_session() -> bool {
-    std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some()
+    std::env::var_os("SSH_CONNECTION").is_some()
+        || std::env::var_os("SSH_TTY").is_some()
+        || std::env::var_os(crate::hc::client::HC_REMOTE_CLIENT_ENV).is_some()
 }
 
 #[cfg(any(windows, test))]

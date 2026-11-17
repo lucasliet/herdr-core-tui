@@ -320,6 +320,8 @@ struct InprocessEnvGuard {
     prev_api_socket: Option<std::ffi::OsString>,
     prev_client_socket: Option<std::ffi::OsString>,
     prev_startup_cwd: Option<std::ffi::OsString>,
+    prev_hc_remote_client: Option<std::ffi::OsString>,
+    prev_remote_prefs: Option<std::ffi::OsString>,
     temp_dir: PathBuf,
 }
 
@@ -339,13 +341,21 @@ impl Drop for InprocessEnvGuard {
             Some(val) => std::env::set_var(STARTUP_CWD_ENV_VAR, val),
             None => std::env::remove_var(STARTUP_CWD_ENV_VAR),
         }
+        match &self.prev_hc_remote_client {
+            Some(val) => std::env::set_var(crate::hc::client::HC_REMOTE_CLIENT_ENV, val),
+            None => std::env::remove_var(crate::hc::client::HC_REMOTE_CLIENT_ENV),
+        }
+        match &self.prev_remote_prefs {
+            Some(val) => std::env::set_var(crate::remote::REMOTE_PREFERENCES_ENV_VAR, val),
+            None => std::env::remove_var(crate::remote::REMOTE_PREFERENCES_ENV_VAR),
+        }
         let _ = std::fs::remove_dir_all(&self.temp_dir);
     }
 }
 
 /// Performs auto-detect launch using an in-process `HeadlessServer` backed by
-/// the already-installed `hc` (`herdr-core`) daemon.
-pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
+/// the already-installed `hc` (`herdr-core`) daemon (local or over SSH via `--remote`).
+pub fn auto_detect_launch(saved_federation: bool, remote_target: Option<&str>) -> io::Result<()> {
     crate::platform::terminal_grid_size().map_err(|err| {
         io::Error::new(
             err.kind(),
@@ -354,30 +364,35 @@ pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
     })?;
 
     let hc_session = crate::session::active_name();
-    match crate::hc::core_bin::find(None) {
-        Some(core_bin) => {
-            crate::hc::core_bin::use_core(core_bin);
-            match crate::hc::Core::connect(hc_session.as_deref()) {
-                Ok(core) => {
-                    crate::hc::set_global_core(Some(core));
-                }
-                Err(error) => {
-                    if !saved_federation {
-                        return Err(error);
+    if let Some(target) = remote_target {
+        let core = crate::hc::Core::connect_remote(target, hc_session.as_deref())?;
+        crate::hc::set_global_core(Some(core));
+    } else {
+        match crate::hc::core_bin::find(None) {
+            Some(core_bin) => {
+                crate::hc::core_bin::use_core(core_bin);
+                match crate::hc::Core::connect(hc_session.as_deref()) {
+                    Ok(core) => {
+                        crate::hc::set_global_core(Some(core));
                     }
-                    tracing::warn!(%error, "hc connection failed; keeping saved machines available");
+                    Err(error) => {
+                        if !saved_federation {
+                            return Err(error);
+                        }
+                        tracing::warn!(%error, "hc connection failed; keeping saved machines available");
+                    }
                 }
             }
-        }
-        None => {
-            let err = io::Error::new(
-                io::ErrorKind::NotFound,
-                "cannot find `hc` (herdr-core) on this machine; install `hc` or `herdr-app` first, or set HC_BIN",
-            );
-            if !saved_federation {
-                return Err(err);
+            None => {
+                let err = io::Error::new(
+                    io::ErrorKind::NotFound,
+                    "cannot find `hc` (herdr-core) on this machine; install `hc` or `herdr-app` first, or set HC_BIN",
+                );
+                if !saved_federation {
+                    return Err(err);
+                }
+                tracing::warn!(%err, "hc binary not found; keeping saved machines available");
             }
-            tracing::warn!(%err, "hc binary not found; keeping saved machines available");
         }
     }
 
@@ -393,8 +408,18 @@ pub fn auto_detect_launch(saved_federation: bool) -> io::Result<()> {
             crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
         ),
         prev_startup_cwd: std::env::var_os(STARTUP_CWD_ENV_VAR),
+        prev_hc_remote_client: std::env::var_os(crate::hc::client::HC_REMOTE_CLIENT_ENV),
+        prev_remote_prefs: std::env::var_os(crate::remote::REMOTE_PREFERENCES_ENV_VAR),
         temp_dir: temp_dir.clone(),
     };
+    if let Some(target) = remote_target {
+        std::env::set_var(crate::hc::client::HC_REMOTE_CLIENT_ENV, "1");
+        let sess = hc_session.as_deref().unwrap_or("default");
+        std::env::set_var(
+            crate::remote::REMOTE_PREFERENCES_ENV_VAR,
+            format!("hc:{target}:{sess}"),
+        );
+    }
     std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, &api_sock);
     std::env::set_var(
         crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,

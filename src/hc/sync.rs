@@ -23,11 +23,12 @@ use crate::workspace::{
 use super::client::{
     configured_machines, get_pane_shared_id, get_space_id, get_tab_shared_id,
     get_workspace_machine, get_workspace_raw_name, is_address_known, is_known_space_id,
-    is_known_tab_id, last_written_version, pane_address, pane_for_address,
-    queue_pending_attach_for_pane, set_configured_machines, set_known_doc_ids,
-    set_last_written_version, set_local_doc_version, set_machine_doc_version, set_pane_shared_id,
-    set_space_id, set_tab_shared_id, set_workspace_machine, set_workspace_raw_name,
-    tracked_doc_machines, unregister_pane, Core, EventLines, HcMachineInfo, Stream,
+    is_known_tab_id, last_written_version, mark_terminal_seen_locally, pane_address,
+    pane_for_address, queue_pending_attach_for_pane, record_terminal_turn, set_configured_machines,
+    set_known_doc_ids, set_last_written_version, set_local_doc_version, set_machine_doc_version,
+    set_pane_shared_id, set_space_id, set_tab_shared_id, set_workspace_machine,
+    set_workspace_raw_name, terminal_turn_and_seen, tracked_doc_machines, unregister_pane, Core,
+    EventLines, HcMachineInfo, Stream,
 };
 use super::doc::{
     fresh_id, read_doc, write_doc, Document, HcAxis, HcContent, HcKind, HcNode, HcSize,
@@ -1394,6 +1395,48 @@ pub fn sync_workspaces_to_hc(core: &Core, workspaces: &[Workspace]) {
     write_hc_doc_snapshot(core, snapshot);
 }
 
+pub fn sync_hc_seen_for_pane(pane_id: PaneId) {
+    let Some(addr) = pane_address(pane_id) else {
+        return;
+    };
+    let (turn, seen) = terminal_turn_and_seen(&addr);
+    if turn == 0 || seen >= turn {
+        return;
+    }
+    mark_terminal_seen_locally(&addr, turn);
+    let Some(core) = super::global_core() else {
+        return;
+    };
+    let value = turn.to_string();
+    let _ = crate::thread_spawn::spawn_named("hc-seen-write", move || {
+        if let Err(err) = core.label_terminal(&addr, json!({ "herdr.seen": value })) {
+            tracing::debug!(address = %addr, err = %err, "failed to sync herdr.seen to hc");
+        }
+    });
+}
+
+type C3RepoFacts = (Option<String>, Option<(usize, usize)>);
+
+fn c3_repository_facts(info: &Value) -> Option<C3RepoFacts> {
+    let repo = info.get("repository")?;
+    if repo.get("state").and_then(Value::as_str) != Some("ready") {
+        return None;
+    }
+    let branch = repo
+        .get("branch")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned);
+    let ahead_behind = repo.get("ahead_behind").and_then(|ab| {
+        let arr = ab.as_array()?;
+        let ahead = usize::try_from(arr.first()?.as_u64()?).ok()?;
+        let behind = usize::try_from(arr.get(1)?.as_u64()?).ok()?;
+        Some((ahead, behind))
+    });
+    Some((branch, ahead_behind))
+}
+
 pub fn apply_hc_metadata_to_state(
     state: &mut AppState,
     terminals: &[Value],
@@ -1408,12 +1451,54 @@ pub fn apply_hc_metadata_to_state(
         let Some(pane_id) = pane_for_address(addr) else {
             continue;
         };
+        let turn = info.get("turn").and_then(Value::as_u64).unwrap_or(0);
+        let seen_label = terminal_label_str(info, "herdr.seen")
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0);
+        let turn_or_seen_changed =
+            record_terminal_turn(addr, turn, seen_label) != Some((turn, seen_label));
+
         let mut non_agent_changed = false;
         let maybe_update = state.update_terminal_state(pane_id, |terminal| {
             let (mutation, meta_changed) = apply_hc_metadata_mutation(terminal, info);
             non_agent_changed = meta_changed;
             mutation
         });
+
+        if turn_or_seen_changed
+            && turn > 0
+            && map_hc_status(info).is_some_and(|(s, ..)| s == AgentState::Idle)
+        {
+            let target_seen = seen_label >= turn;
+            for ws in &mut state.workspaces {
+                if let Some(pane) = ws.pane_state_mut(pane_id) {
+                    if pane.seen != target_seen {
+                        pane.seen = target_seen;
+                        dirty = true;
+                    }
+                    break;
+                }
+            }
+        }
+
+        if let Some((branch, ahead_behind)) = c3_repository_facts(info) {
+            for ws in &mut state.workspaces {
+                if ws.find_tab_index_for_pane(pane_id).is_some()
+                    && ws.focused_pane_id() == Some(pane_id)
+                {
+                    if branch.is_some() && ws.cached_git_branch != branch {
+                        ws.cached_git_branch = branch;
+                        dirty = true;
+                    }
+                    if ws.cached_git_ahead_behind != ahead_behind {
+                        ws.cached_git_ahead_behind = ahead_behind;
+                        dirty = true;
+                    }
+                    break;
+                }
+            }
+        }
+
         if let Some(update) = maybe_update {
             updates.push(update);
             dirty = true;
@@ -2030,8 +2115,16 @@ mod tests {
         ));
     }
 
+    fn registry_test_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+    }
+
     #[test]
     fn capture_hc_doc_snapshot_separates_local_and_remote_machines() {
+        let _guard = registry_test_guard();
         super::super::client::reset_registry();
         let local_ws = Workspace::test_new("local-proj");
         let local_pane = local_ws.tabs[0].root_pane;
@@ -2151,6 +2244,7 @@ mod tests {
 
     #[test]
     fn reconcile_hc_docs_updates_names_and_removes_deleted_external_tabs() {
+        let _guard = registry_test_guard();
         super::super::client::reset_registry();
         let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
         let mut app = App::new(
@@ -2224,6 +2318,61 @@ mod tests {
             &finished_terminals
         ));
         assert!(app.state.workspaces.is_empty());
+        super::super::client::reset_registry();
+    }
+
+    #[test]
+    fn c3_repository_facts_and_herdr_seen_turn_sync_work() {
+        let _guard = registry_test_guard();
+        super::super::client::reset_registry();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let ws = Workspace::test_new("repo");
+        let pane_id = ws.tabs[0].root_pane;
+        app.state.workspaces.push(ws);
+        app.state.selected = 0;
+        app.state.active = Some(0);
+        register_pane_address(pane_id, "oracle/t1".into());
+
+        let unseen_info = json!({
+            "address": "oracle/t1",
+            "state": "live",
+            "turn": 3,
+            "labels": { "herdr.seen": "2" },
+            "status": { "state": "idle", "label": "claude" },
+            "repository": {
+                "state": "ready",
+                "branch": "feat/c3",
+                "ahead_behind": [2, 1]
+            }
+        });
+        let (_updates, dirty) = apply_hc_metadata_to_state(&mut app.state, &[unseen_info]);
+        assert!(dirty);
+        assert!(!app.state.workspaces[0].pane_state(pane_id).unwrap().seen);
+        assert_eq!(
+            app.state.workspaces[0].cached_git_branch.as_deref(),
+            Some("feat/c3")
+        );
+        assert_eq!(
+            app.state.workspaces[0].cached_git_ahead_behind,
+            Some((2, 1))
+        );
+
+        let seen_info = json!({
+            "address": "oracle/t1",
+            "state": "live",
+            "turn": 3,
+            "labels": { "herdr.seen": "3" },
+            "status": { "state": "idle", "label": "claude" }
+        });
+        let _ = apply_hc_metadata_to_state(&mut app.state, &[seen_info]);
+        assert!(app.state.workspaces[0].pane_state(pane_id).unwrap().seen);
         super::super::client::reset_registry();
     }
 }

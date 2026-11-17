@@ -399,6 +399,7 @@ impl AppState {
                     public_tab_id_for_index(ws, active_tab).unwrap_or_else(|| workspace_id.clone());
                 crate::logging::tab_focused(&workspace_id, &tab_id);
             }
+            self.mark_active_tab_seen();
             self.record_pane_focus_after_navigation(previous_focus);
         }
     }
@@ -430,6 +431,7 @@ impl AppState {
                 public_tab_id_for_index(ws, tab_idx).unwrap_or_else(|| workspace_id.clone());
             crate::logging::tab_focused(&workspace_id, &tab_id);
         }
+        self.mark_active_tab_seen();
         self.record_pane_focus_after_navigation(previous_focus);
         true
     }
@@ -463,11 +465,12 @@ impl AppState {
         };
 
         let mut changed = false;
-        for pane in tab.panes.values_mut() {
+        for (&pane_id, pane) in &mut tab.panes {
             if !pane.seen {
                 pane.seen = true;
                 changed = true;
             }
+            crate::hc::sync::sync_hc_seen_for_pane(pane_id);
         }
         changed
     }
