@@ -207,12 +207,14 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # type = "shell" runs detached in the background.
 # type = "pane" opens a temporary pane and closes it when the command exits.
 # type = "popup" opens a session-modal terminal without changing the tab layout.
+# Popups running bare shells (e.g. `exec "${SHELL:-sh}"`) persist per tab by default;
+# set `persistent = true` or `persistent = false` on any popup binding to override.
 # Popup width and height accept terminal cells or percentages such as "80%".
 # On Windows, command strings run through cmd.exe /d /c.
 # [[keys.command]]
-# key = "prefix+alt+g"
+# key = "alt+f"
 # type = "popup"
-# command = "lazygit"
+# command = "exec \"${SHELL:-sh}\""
 # width = "80%"
 # height = "80%"
 

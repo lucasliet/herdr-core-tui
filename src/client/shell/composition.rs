@@ -571,17 +571,30 @@ impl ClientShellState {
             {
                 occlusion.start_popup(geometry.outer);
                 let mut composed = frame.to_ratatui_buffer()?;
-                let block = ratatui::widgets::Block::default()
-                    .borders(ratatui::widgets::Borders::ALL)
-                    .border_style(ratatui::style::Style::default().fg(self.config.palette.accent))
-                    .title(popup.title.clone())
-                    .style(ratatui::style::Style::default().bg(self.config.palette.panel_bg));
-                ratatui::widgets::Widget::render(
-                    ratatui::widgets::Clear,
-                    geometry.outer,
-                    &mut composed,
-                );
-                ratatui::widgets::Widget::render(block, geometry.outer, &mut composed);
+                let persistent_float = popup.title.starts_with("float ");
+                if persistent_float {
+                    render_persistent_float_chrome(
+                        &mut composed,
+                        layout.pane_surface,
+                        geometry.outer,
+                        &popup.title,
+                        &self.config.palette,
+                    );
+                } else {
+                    let block = ratatui::widgets::Block::default()
+                        .borders(ratatui::widgets::Borders::ALL)
+                        .border_style(
+                            ratatui::style::Style::default().fg(self.config.palette.accent),
+                        )
+                        .title(popup.title.clone())
+                        .style(ratatui::style::Style::default().bg(self.config.palette.panel_bg));
+                    ratatui::widgets::Widget::render(
+                        ratatui::widgets::Clear,
+                        geometry.outer,
+                        &mut composed,
+                    );
+                    ratatui::widgets::Widget::render(block, geometry.outer, &mut composed);
+                }
                 frame.replace_from_ratatui_buffer_preserving_effects(&composed, None);
                 blit_pane_surface(&mut frame, &popup.frame, geometry.inner);
                 self.hits.popup = Some(PaneHit {
@@ -815,5 +828,68 @@ fn client_popup_size(size: crate::protocol::ClientShellPopupSize) -> crate::popu
         crate::protocol::ClientShellPopupSize::Percent(percent) => {
             crate::popup_size::PopupSize::Percent(percent)
         }
+    }
+}
+
+fn render_persistent_float_chrome(
+    buf: &mut Buffer,
+    pane_surface: Rect,
+    outer: Rect,
+    full_title: &str,
+    palette: &Palette,
+) {
+    for y in pane_surface.top()..pane_surface.bottom() {
+        for x in pane_surface.left()..pane_surface.right() {
+            let cell = &mut buf[(x, y)];
+            cell.set_style(cell.style().add_modifier(ratatui::style::Modifier::DIM));
+        }
+    }
+
+    let inner_w = usize::from(outer.width.saturating_sub(2));
+    let binding = full_title
+        .strip_prefix("float ")
+        .and_then(|rest| rest.split(" — ").next())
+        .unwrap_or("popup");
+    let hint_text = format!("{binding} hide · esc sends to program");
+    let need = usize::from(super::render::display_width(full_title))
+        + usize::from(super::render::display_width(&hint_text))
+        + 5;
+    let hint = (inner_w >= need).then_some(hint_text);
+    let title_budget = inner_w.saturating_sub(3).saturating_sub(
+        hint.as_ref()
+            .map_or(0, |h| usize::from(super::render::display_width(h)) + 2),
+    );
+    let title = crate::ui::truncate_end(full_title, title_budget);
+
+    let mut block = ratatui::widgets::Block::default()
+        .borders(ratatui::widgets::Borders::ALL)
+        .border_type(ratatui::widgets::BorderType::Rounded)
+        .border_style(
+            ratatui::style::Style::default()
+                .fg(palette.accent)
+                .bg(palette.panel_bg),
+        )
+        .style(ratatui::style::Style::default().bg(palette.panel_bg))
+        .title(format!(" {title} "));
+    if let Some(hint) = hint {
+        block = block.title(
+            ratatui::text::Line::from(format!(" {hint} "))
+                .alignment(ratatui::layout::Alignment::Right),
+        );
+    }
+
+    ratatui::widgets::Widget::render(ratatui::widgets::Clear, outer, buf);
+    ratatui::widgets::Widget::render(block, outer, buf);
+
+    let mut shade = |x: u16, y: u16| {
+        if pane_surface.contains(ratatui::layout::Position::new(x, y)) {
+            buf[(x, y)].set_bg(palette.surface_dim);
+        }
+    };
+    for y in outer.top() + 1..=outer.bottom() {
+        shade(outer.right(), y);
+    }
+    for x in outer.left()..=outer.right() {
+        shade(x, outer.bottom());
     }
 }

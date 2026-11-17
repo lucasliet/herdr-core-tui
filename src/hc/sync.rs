@@ -2003,6 +2003,7 @@ pub fn handle_hc_sync(
     app.state.session_dirty = was_dirty;
 
     if dirty {
+        app.sync_persistent_floats();
         app.render_dirty.request_generic();
         app.render_notify.notify_one();
     }

@@ -271,6 +271,7 @@ impl ClientShellConfig {
                             description: command.description.clone(),
                             width: None,
                             height: None,
+                            persistent: None,
                         })
                     })
                     .collect();
@@ -298,6 +299,7 @@ impl ClientShellConfig {
                         description: command.description.clone(),
                         width: None,
                         height: None,
+                        persistent: false,
                     });
             }
         }

@@ -20,6 +20,16 @@ pub(crate) struct PopupPaneState {
     pub terminal_id: crate::terminal::TerminalId,
     pub width: Option<crate::popup_size::PopupSize>,
     pub height: Option<crate::popup_size::PopupSize>,
+    pub persistent: bool,
+    pub owner_tab_id: Option<String>,
+    pub command_label: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ParkedFloatState {
+    pub owner_tab_id: String,
+    pub pane: PopupPaneState,
+    pub restore_on_return: bool,
 }
 
 use crate::terminal_theme::{HostAppearance, TerminalTheme};
@@ -875,6 +885,8 @@ pub struct AppState {
     pub(crate) plugin_panes: std::collections::HashMap<PaneId, PluginPaneRecord>,
     /// Session-modal terminal popup. This is intentionally outside workspace layouts.
     pub(crate) popup_pane: Option<PopupPaneState>,
+    /// Per-tab persistent floats currently hidden behind their owning tab.
+    pub(crate) parked_floats: std::collections::HashMap<(String, String), ParkedFloatState>,
     /// Recent plugin action/event command executions.
     pub(crate) plugin_command_logs: Vec<crate::api::schema::PluginCommandLogInfo>,
     pub(crate) next_plugin_command_log_id: u64,
@@ -1113,6 +1125,7 @@ impl AppState {
             installed_plugins: std::collections::HashMap::new(),
             plugin_panes: std::collections::HashMap::new(),
             popup_pane: None,
+            parked_floats: std::collections::HashMap::new(),
             plugin_command_logs: Vec::new(),
             next_plugin_command_log_id: 1,
             plugin_commands_in_flight: 0,

@@ -126,6 +126,17 @@ impl HeadlessServer {
     }
 
     pub(super) fn reconcile_client_shell_locations(&mut self) {
+        self.app.sync_persistent_floats();
+        if let Some(owner) = self
+            .app
+            .state
+            .popup_pane
+            .as_ref()
+            .filter(|popup| popup.persistent)
+            .and_then(|popup| popup.owner_tab_id.clone())
+        {
+            self.popup_owner_tab_id = Some(owner);
+        }
         if self.app.state.popup_pane.is_none() {
             self.popup_owner_tab_id = None;
         } else if self
@@ -607,6 +618,8 @@ impl HeadlessServer {
         {
             let _ = resize_popup_runtime(&self.app, Rect::new(0, 0, cols, rows), cell_size);
         }
+        self.app
+            .resize_parked_floats(Rect::new(0, 0, cols, rows), cell_size);
         true
     }
 
@@ -924,10 +937,17 @@ impl HeadlessServer {
         let popup_owner = self.shell_tab_id_for_client(client_id);
         let changed = self.handle_api_request_with_shutdown_check_inner(msg, false, true);
         self.focus_shell_client_on_default_target(client_id);
+        let synced_floats = self.app.sync_persistent_floats();
         if !popup_before && self.app.state.popup_pane.is_some() {
-            self.popup_owner_tab_id = popup_owner;
+            self.popup_owner_tab_id = self
+                .app
+                .state
+                .popup_pane
+                .as_ref()
+                .and_then(|popup| popup.owner_tab_id.clone())
+                .or(popup_owner);
         }
-        if reconcile || self.app.state.popup_pane.is_some() != popup_before {
+        if reconcile || synced_floats || self.app.state.popup_pane.is_some() != popup_before {
             self.reconcile_client_shell_locations();
         }
         let focus_after = self.shell_focus_target(client_id);

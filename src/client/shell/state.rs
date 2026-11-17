@@ -1727,7 +1727,7 @@ impl ClientShellState {
             self.endpoint_error = None;
             self.endpoint_error_deadline = None;
         }
-        if next_popup.is_some() {
+        if next_popup.is_some() || previous_popup.is_some() {
             self.popup_pending = false;
             self.popup_pending_deadline = None;
         }

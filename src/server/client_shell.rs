@@ -522,12 +522,41 @@ fn render_popup_surface(
     let (buffer, cursor) =
         crate::server::render_stream::render_terminal_virtual(runtime, content_area);
     let hyperlinks = runtime.visible_hyperlinks(content_area);
-    let title = app
-        .state
-        .terminals
-        .get(&popup.terminal_id)
-        .and_then(|terminal| terminal.manual_label.clone())
-        .unwrap_or_else(|| "popup".to_owned());
+    let title = if popup.persistent {
+        let binding = popup.command_label.as_deref().unwrap_or("popup");
+        let mut formatted = format!("float {binding}");
+        if let Some(tab_name) = popup
+            .owner_tab_id
+            .as_deref()
+            .and_then(|id| app.parse_tab_id(id))
+            .and_then(|(ws, tab)| app.state.workspaces.get(ws)?.tab_display_name(tab))
+        {
+            formatted.push_str(" — ");
+            formatted.push_str(&tab_name);
+        }
+        if let Some(program) = app
+            .state
+            .terminals
+            .get(&popup.terminal_id)
+            .and_then(|terminal| {
+                terminal
+                    .manual_label
+                    .clone()
+                    .or_else(|| terminal.terminal_title_stripped())
+            })
+            .filter(|t| !t.trim().is_empty())
+        {
+            formatted.push_str(" — ");
+            formatted.push_str(&program);
+        }
+        formatted
+    } else {
+        app.state
+            .terminals
+            .get(&popup.terminal_id)
+            .and_then(|terminal| terminal.manual_label.clone())
+            .unwrap_or_else(|| "popup".to_owned())
+    };
     let (pixel_width, pixel_height) = if cell_size.is_known() {
         (
             u32::from(content_area.width) * cell_size.width_px,

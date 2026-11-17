@@ -630,6 +630,16 @@ impl ClientShellState {
             return None;
         }
         if let Some(target) = self.popup_input_target() {
+            if self.popup_is_persistent() {
+                if let Some(binding) =
+                    crate::input::resolve_direct_binding(&self.config.keybinds.keybinds, key)
+                {
+                    if is_persistent_float_shell_shortcut(&binding) {
+                        self.record_binding(binding, outcome);
+                        return None;
+                    }
+                }
+            }
             return Some(target);
         }
         if self.popup_pending {
@@ -1185,6 +1195,13 @@ impl ClientShellState {
             .map(|terminal_id| ClientInputTarget::Popup(terminal_id.clone()))
     }
 
+    fn popup_is_persistent(&self) -> bool {
+        self.pane_surface
+            .as_ref()
+            .and_then(|surface| surface.popup.as_deref())
+            .is_some_and(|popup| popup.title.starts_with("float "))
+    }
+
     fn push_pane_key(
         &self,
         target: ClientInputTarget,
@@ -1200,5 +1217,25 @@ impl ClientShellState {
         if let Some(pane_id) = self.focused_pane_id() {
             super::push_target_event(ClientInputTarget::Pane(pane_id), event, outcome);
         }
+    }
+}
+
+fn is_persistent_float_shell_shortcut(binding: &crate::input::KeybindMatch) -> bool {
+    use crate::config::CustomCommandAction;
+    use crate::input::{KeybindAction, KeybindMatch};
+    match binding {
+        KeybindMatch::Action(
+            KeybindAction::PreviousTab
+            | KeybindAction::NextTab
+            | KeybindAction::PreviousAgent
+            | KeybindAction::NextAgent
+            | KeybindAction::PreviousWorkspace
+            | KeybindAction::NextWorkspace
+            | KeybindAction::SwitchTab(_)
+            | KeybindAction::SwitchWorkspace(_)
+            | KeybindAction::FocusAgent(_),
+        ) => true,
+        KeybindMatch::Command(command) => command.action == CustomCommandAction::Popup,
+        _ => false,
     }
 }

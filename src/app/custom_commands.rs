@@ -230,6 +230,9 @@ impl App {
         &mut self,
         binding: &crate::config::CustomCommandKeybind,
     ) -> io::Result<()> {
+        if binding.persistent {
+            return self.toggle_persistent_popup_command(binding, self.custom_command_env().0);
+        }
         self.spawn_popup_shell_command(
             &binding.command,
             None,
@@ -592,6 +595,7 @@ mod tests {
             description: Some("safe description".into()),
             width: None,
             height: None,
+            persistent: false,
         }
     }
 

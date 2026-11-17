@@ -569,6 +569,7 @@ fn popup_command_blocks_underlying_input_until_surface_or_error() {
         description: None,
         width: None,
         height: None,
+        persistent: false,
     };
     let mut projection = snapshot();
     projection
@@ -622,6 +623,7 @@ fn popup_command_blocks_underlying_input_until_surface_or_error() {
         description: None,
         width: None,
         height: None,
+        persistent: false,
     };
     let mut invoke = ClientShellInput::default();
     state.record_binding(crate::input::KeybindMatch::Command(binding), &mut invoke);
@@ -1254,4 +1256,83 @@ fn retained_surface_patch_rejects_stale_base_without_mutating_surface() {
     });
     assert!(matches!(outcome, ClientPaneSurfacePatchOutcome::Rejected));
     assert_eq!(state.pane_surface, before);
+}
+
+#[test]
+fn persistent_float_allows_direct_popup_toggle_and_tab_nav_and_renders_float_chrome() {
+    let mut config = Config::default();
+    config.keys.next_tab = crate::config::BindingConfig::One("alt+right".into());
+    config
+        .keys
+        .command
+        .push(crate::config::CommandKeybindConfig {
+            key: crate::config::BindingConfig::One("alt+f".into()),
+            command: r#"exec "${SHELL:-sh}""#.into(),
+            action_type: crate::config::CommandKeybindType::Popup,
+            description: None,
+            width: None,
+            height: None,
+            persistent: None,
+        });
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    let mut snap = snapshot();
+    snap.commands.push(crate::protocol::ClientShellCommand {
+        command_id: "cmd_float".into(),
+        binding_label: "alt+f".into(),
+        binding_labels: vec!["alt+f".into()],
+        action: crate::protocol::ClientShellCommandAction::Popup,
+        description: None,
+    });
+    state.set_snapshot(Box::new(snap));
+
+    let mut float_surface = surface_with_popup();
+    {
+        let popup = float_surface.popup.as_deref_mut().unwrap();
+        popup.title = "float alt+f — Tab 1 — zsh".into();
+        popup.width = Some(crate::protocol::ClientShellPopupSize::Cells(80));
+        popup.height = Some(crate::protocol::ClientShellPopupSize::Cells(12));
+    }
+    state.set_pane_surface(float_surface);
+    let narrow = state.compose(96, 20).expect("narrow float frame");
+    let narrow_cells: String = narrow.cells.iter().map(|c| c.symbol.as_str()).collect();
+    assert!(narrow_cells.contains('╭'));
+
+    let wide = state.compose(130, 24).expect("wide float frame");
+    let text_cells: String = wide.cells.iter().map(|c| c.symbol.as_str()).collect();
+    assert!(text_cells.contains('╭'));
+    assert!(text_cells.contains("alt+f hide"));
+
+    // Ctrl+B and Esc still forward directly to the persistent float PTY.
+    for bytes in [b"\x02".as_slice(), b"\x1b".as_slice()] {
+        let input = state.handle_input_bytes(bytes);
+        assert!(matches!(
+            &input.requests[..],
+            [ClientMessage::ClientShellPopupInput { terminal_id, .. }]
+                if terminal_id == "terminal-popup"
+        ));
+    }
+
+    // Pressing Alt+F toggles the float instead of typing into the popup PTY.
+    let toggle = state.handle_raw_events(vec![RawInputEvent::Key(
+        crate::input::TerminalKey::new(KeyCode::Char('f'), KeyModifiers::ALT)
+            .with_kind(crossterm::event::KeyEventKind::Press),
+    )]);
+    assert!(toggle.requests.is_empty());
+    assert!(toggle
+        .actions
+        .iter()
+        .any(|a| matches!(a, ClientShellAction::Endpoint { .. })));
+    assert!(state.popup_pending);
+
+    // Direct NextTab binding bypasses the popup to switch tabs while popup stays live.
+    state.popup_pending = false;
+    let next_tab = state.handle_raw_events(vec![RawInputEvent::Key(
+        crate::input::TerminalKey::new(KeyCode::Right, KeyModifiers::ALT)
+            .with_kind(crossterm::event::KeyEventKind::Press),
+    )]);
+    assert!(next_tab.requests.is_empty());
+    assert!(next_tab
+        .actions
+        .iter()
+        .any(|a| matches!(a, ClientShellAction::Endpoint { .. })));
 }

@@ -134,6 +134,10 @@ pub struct CommandKeybindConfig {
     pub width: Option<PopupSize>,
     /// Optional popup height as cells or a percentage string when type = "popup".
     pub height: Option<PopupSize>,
+    /// Optional persistence flag when type = "popup". Unset defaults to persistent
+    /// for interactive shells (`exec "${SHELL:-sh}"`, `zsh -l`, etc.) and ephemeral
+    /// for one-shot commands.
+    pub persistent: Option<bool>,
 }
 
 impl Default for CommandKeybindConfig {
@@ -145,6 +149,7 @@ impl Default for CommandKeybindConfig {
             description: None,
             width: None,
             height: None,
+            persistent: None,
         }
     }
 }
@@ -334,6 +339,39 @@ pub struct CustomCommandKeybind {
     pub description: Option<String>,
     pub width: Option<PopupSize>,
     pub height: Option<PopupSize>,
+    pub persistent: bool,
+}
+
+const INTERACTIVE_POPUP_SHELLS: &[&str] = &[
+    "sh", "bash", "zsh", "fish", "nu", "ksh", "dash", "ash", "csh", "tcsh", "elvish", "xonsh",
+    "pwsh",
+];
+
+/// Returns `true` when `command` is a bare interactive shell invocation.
+pub(crate) fn popup_command_is_shell(command: &str) -> bool {
+    let mut words = command.split_whitespace().peekable();
+    if words.peek() == Some(&"exec") {
+        words.next();
+    }
+    let mut program = None;
+    for word in words {
+        let word = word.trim_matches(|c| c == '\'' || c == '"');
+        if word.starts_with('-') {
+            continue;
+        }
+        if program.is_some() {
+            return false;
+        }
+        program = Some(word);
+    }
+    let Some(program) = program else {
+        return false;
+    };
+    if program.contains("$SHELL") || program.contains("${SHELL") {
+        return true;
+    }
+    let basename = program.rsplit('/').next().unwrap_or(program);
+    INTERACTIVE_POPUP_SHELLS.contains(&basename)
 }
 
 /// Parsed keybinds for Herdr actions.
@@ -832,8 +870,11 @@ fn append_custom_command_bindings(
             CommandKeybindType::Popup => CustomCommandAction::Popup,
             CommandKeybindType::PluginAction => CustomCommandAction::PluginAction,
         };
-        let (width, height) = if action == CustomCommandAction::Popup {
-            (command.width, command.height)
+        let (width, height, persistent) = if action == CustomCommandAction::Popup {
+            let persistent = command
+                .persistent
+                .unwrap_or_else(|| popup_command_is_shell(&command.command));
+            (command.width, command.height, persistent)
         } else {
             if command.width.is_some() || command.height.is_some() {
                 let diag = format!(
@@ -842,7 +883,14 @@ fn append_custom_command_bindings(
                 warn!(message = %diag, "config diagnostic");
                 diagnostics.push(diag);
             }
-            (None, None)
+            if command.persistent.is_some() {
+                let diag = format!(
+                    "popup persistent flag on non-popup custom command: keys.command[{index}]; ignoring persistent"
+                );
+                warn!(message = %diag, "config diagnostic");
+                diagnostics.push(diag);
+            }
+            (None, None, false)
         };
         let label = bindings.label().unwrap_or_else(|| "unset".to_string());
         keybinds.custom_commands.push(CustomCommandKeybind {
@@ -853,6 +901,7 @@ fn append_custom_command_bindings(
             description: command.description.clone(),
             width,
             height,
+            persistent,
         });
     }
 }
@@ -2573,5 +2622,41 @@ width = "80%"
             .collect_diagnostics()
             .iter()
             .any(|diag| diag.contains("popup size on non-popup custom command")));
+    }
+
+    #[test]
+    fn popup_persistent_defaults_for_shells_and_honors_explicit_override() {
+        let config: Config = toml::from_str(
+            r#"
+[[keys.command]]
+key = "alt+f"
+command = 'exec "${SHELL:-sh}"'
+type = "popup"
+
+[[keys.command]]
+key = "prefix+g"
+command = "lazygit"
+type = "popup"
+
+[[keys.command]]
+key = "prefix+alt+l"
+command = "lazygit"
+type = "popup"
+persistent = true
+
+[[keys.command]]
+key = "prefix+alt+s"
+command = "zsh -l"
+type = "popup"
+persistent = false
+"#,
+        )
+        .unwrap();
+        let keybinds = config.keybinds();
+        assert_eq!(keybinds.custom_commands.len(), 4);
+        assert!(keybinds.custom_commands[0].persistent);
+        assert!(!keybinds.custom_commands[1].persistent);
+        assert!(keybinds.custom_commands[2].persistent);
+        assert!(!keybinds.custom_commands[3].persistent);
     }
 }
