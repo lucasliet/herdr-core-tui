@@ -224,7 +224,11 @@ jobs:
           set -euo pipefail
           TAG="${INPUT_TAG:-$GITHUB_REF_NAME}"
           PRERELEASE="false"
-          if [ "$INPUT_PRERELEASE" = "true" ] || [[ "$TAG" == *-* ]]; then
+          TAG_SUFFIX=""
+          if [[ "$TAG" == *-* ]]; then
+            TAG_SUFFIX="${TAG#*-}"
+          fi
+          if [ "$INPUT_PRERELEASE" = "true" ] || { [ -n "$TAG_SUFFIX" ] && ! [[ "$TAG_SUFFIX" =~ ^core-tui\.[0-9]+$ ]]; }; then
             PRERELEASE="true"
           fi
           mkdir -p dist
