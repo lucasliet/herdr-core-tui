@@ -18,7 +18,6 @@ const STATUSES: &[Choice<AgentStatus>] = &[
     Choice::new("working", AgentStatus::Working),
     Choice::new("blocked", AgentStatus::Blocked),
     Choice::new("done", AgentStatus::Done),
-    Choice::new("waiting", AgentStatus::Waiting),
     Choice::new("unknown", AgentStatus::Unknown),
 ];
 const EXPLAIN_FORMATS: &[Choice<bool>] = &[Choice::new("text", false), Choice::new("json", true)];
