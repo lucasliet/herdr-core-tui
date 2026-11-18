@@ -149,6 +149,7 @@ const DEFAULT_CONFIG: &str = r##"# herdr configuration
 # settings = "prefix+s"
 # detach = "prefix+q"
 # reload_config = "prefix+shift+r"
+# update = "prefix+u"
 # open_notification_target = "prefix+o"
 # workspace_picker = "prefix+w"
 # goto = "prefix+g"
@@ -580,13 +581,6 @@ fn main() -> io::Result<()> {
         return client::run_client();
     }
 
-    if args.get(1).map(|s| s.as_str()) == Some("update") {
-        println!(
-            "herdr-core-tui (alias hc-tui) runs alongside your existing `hc` / `herdr-app` installation and does not self-update or overwrite `hc`."
-        );
-        return Ok(());
-    }
-
     if args.iter().any(|a| a == "--help" || a == "-h") {
         platform::begin_cli_output();
         println!("herdr-core-tui (alias hc-tui) — terminal UI frontend for herdr-core (hc)");
@@ -597,7 +591,8 @@ fn main() -> io::Result<()> {
         println!("       herdr-core-tui --remote <ssh-target> [--session <name>]");
         println!("       herdr-core-tui session attach <name>");
         println!("       herdr-core-tui completion zsh");
-        println!("       herdr-core-tui update [--handoff]");
+        println!("       herdr-core-tui --upgrade");
+        println!("       herdr-core-tui update");
         println!("       herdr-core-tui channel set <stable|preview>");
         println!("       herdr-core-tui machine <subcommand> ...");
         println!("       herdr-core-tui server stop");
@@ -627,8 +622,8 @@ fn main() -> io::Result<()> {
                 "Show local client and running server status",
             ),
             (
-                "herdr-core-tui update",
-                "Print notice (never overwrites existing `hc`)",
+                "herdr-core-tui --upgrade",
+                "Self-update herdr-core-tui & hc-tui from GitHub Releases (never overwrites `hc`)",
             ),
             (
                 "herdr-core-tui completion zsh",
@@ -707,7 +702,8 @@ fn main() -> io::Result<()> {
         println!("  --remote <target>   Attach through SSH to a remote Herdr server");
         println!("  --remote-keybindings <local|server>");
         println!("                      Keybindings for --remote app attach (default: local)");
-        println!("  --handoff           Opt into live handoff for update or remote attach");
+        println!("  --handoff           Opt into live handoff for remote attach");
+        println!("  --upgrade           Self-update herdr-core-tui & hc-tui from GitHub Releases");
         println!("  --default-config    Print default configuration and exit");
         println!("  --skill             Print the agent skill file and exit");
         println!("  --version, -V       Print version and exit");
@@ -716,7 +712,7 @@ fn main() -> io::Result<()> {
         println!("Config: {}", config::config_path().display());
         println!("Logs:   {}", logging::help_log_paths_summary());
         println!("Env:    HERDR_CONFIG_PATH overrides config file path");
-        println!("Home:   https://herdr.dev");
+        println!("Home:   https://github.com/lucasliet/herdr-core-tui");
         println!();
         println!("{}", cli::AGENT_HELP_FOOTER);
         return Ok(());
@@ -740,12 +736,21 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
+    if args.iter().any(|a| a == "--upgrade") || args.get(1).map(|s| s.as_str()) == Some("update") {
+        if let Err(err) = update::run_fork_upgrade() {
+            eprintln!("error: {err}");
+            std::process::exit(1);
+        }
+        return Ok(());
+    }
+
     // Reject unknown flags
     let known_flags = [
         "--session",
         "--machine",
         "--remote",
         "--remote-keybindings",
+        "--upgrade",
         "--version",
         "-V",
         "--default-config",

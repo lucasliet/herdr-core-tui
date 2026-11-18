@@ -401,6 +401,7 @@ pub struct Keybinds {
     pub goto: ActionKeybinds,
     pub detach: ActionKeybinds,
     pub reload_config: ActionKeybinds,
+    pub update: ActionKeybinds,
     pub open_notification_target: ActionKeybinds,
     pub previous_workspace: ActionKeybinds,
     pub next_workspace: ActionKeybinds,
@@ -584,6 +585,7 @@ impl Config {
             goto: empty_action!(),
             detach: empty_action!(),
             reload_config: empty_action!(),
+            update: empty_action!(),
             open_notification_target: empty_action!(),
             previous_workspace: empty_action!(),
             next_workspace: empty_action!(),
@@ -713,6 +715,7 @@ impl Config {
             apply_action!(keybinds.goto, goto, source);
             apply_action!(keybinds.detach, detach, source);
             apply_action!(keybinds.reload_config, reload_config, source);
+            apply_action!(keybinds.update, update, source);
             apply_action!(
                 keybinds.open_notification_target,
                 open_notification_target,
@@ -2658,5 +2661,24 @@ persistent = false
         assert!(!keybinds.custom_commands[1].persistent);
         assert!(keybinds.custom_commands[2].persistent);
         assert!(!keybinds.custom_commands[3].persistent);
+    }
+
+    #[test]
+    fn update_keybind_defaults_to_prefix_u_and_yields_to_user_binding() {
+        let default_kb = Config::default().keybinds();
+        assert!(!default_kb.update.bindings.is_empty());
+
+        let override_cfg: Config = toml::from_str(
+            r#"
+[[keys.command]]
+key = "prefix+u"
+command = "echo custom"
+"#,
+        )
+        .unwrap();
+        let (kb, diags) = override_cfg.live_keybinds_with_diagnostics().unwrap();
+        assert_eq!(kb.keybinds.custom_commands.len(), 1);
+        assert!(kb.keybinds.update.bindings.is_empty());
+        assert!(!diags.iter().any(|d| d.contains("disabled keys.command")));
     }
 }

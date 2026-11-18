@@ -20,12 +20,18 @@ use std::time::{Duration, Instant};
 
 #[cfg(not(windows))]
 use interprocess::local_socket::traits::Stream as _;
-use serde::{Deserialize, Deserializer};
+use serde::{Deserialize, Deserializer, Serialize};
 
 const STABLE_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/latest.json";
 const PREVIEW_UPDATE_MANIFEST_URL: &str = "https://herdr.dev/preview.json";
 const HOMEBREW_FORMULA_API_URL: &str = "https://formulae.brew.sh/api/formula/herdr.json";
 const HERDR_UPDATE_COMMAND: &str = "herdr update";
+const FORK_LATEST_RELEASE_API_URL: &str =
+    "https://api.github.com/repos/lucasliet/herdr-core-tui/releases/latest";
+const FORK_RELEASES_URL: &str = "https://github.com/lucasliet/herdr-core-tui/releases";
+const FORK_UPDATE_COMMAND: &str = "herdr-core-tui --upgrade";
+const NO_UPDATE_CHECK_ENV_VARS: &[&str] = &["HC_TUI_NO_UPDATE_CHECK", "HERDR_NO_UPDATE_CHECK"];
+const UPDATE_CHECK_CACHE_TTL_MS: u64 = 24 * 60 * 60 * 1_000;
 const HOMEBREW_UPDATE_COMMAND: &str = "brew update && brew upgrade herdr";
 const MISE_UPDATE_COMMAND: &str = "mise upgrade herdr";
 const NIX_UPDATE_COMMAND: &str = "update through Nix";
@@ -293,6 +299,512 @@ impl UpdateManifest {
 impl ManifestReleaseMetadata {
     fn notes_body(&self) -> String {
         self.notes.trim().to_string()
+    }
+}
+
+/// GitHub Releases metadata for the fork (`lucasliet/herdr-core-tui`).
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubRelease {
+    tag_name: String,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+    #[serde(default)]
+    draft: bool,
+    #[serde(default)]
+    assets: Vec<GitHubAsset>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct GitHubAsset {
+    name: String,
+    browser_download_url: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ForkUpdateCache {
+    tag: String,
+    checked_ms: u64,
+    #[serde(default)]
+    body: Option<String>,
+    #[serde(default)]
+    html_url: Option<String>,
+}
+
+type ForkVersion = (Version, Option<u64>);
+
+fn is_update_check_opted_out() -> bool {
+    NO_UPDATE_CHECK_ENV_VARS
+        .iter()
+        .any(|name| env::var_os(name).is_some())
+}
+
+fn current_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn fork_update_cache_path_from_env(
+    xdg_state_home: Option<&std::ffi::OsStr>,
+    home: Option<&std::ffi::OsStr>,
+) -> Option<PathBuf> {
+    let root = xdg_state_home
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            home.filter(|v| !v.is_empty())
+                .map(|h| PathBuf::from(h).join(".local").join("state"))
+        })?;
+    Some(root.join("herdr-core-tui").join("update-check.json"))
+}
+
+fn fork_update_cache_path() -> Option<PathBuf> {
+    fork_update_cache_path_from_env(
+        env::var_os("XDG_STATE_HOME").as_deref(),
+        env::var_os("HOME").as_deref(),
+    )
+}
+
+fn load_fork_update_cache(path: &Path) -> Option<ForkUpdateCache> {
+    let bytes = fs::read(path).ok()?;
+    serde_json::from_slice(&bytes).ok()
+}
+
+fn store_fork_update_cache(path: &Path, cache: &ForkUpdateCache) {
+    if let Some(parent) = path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_vec(cache) {
+        let _ = fs::write(path, json);
+    }
+}
+
+fn parse_fork_version_tag(tag: &str) -> Option<ForkVersion> {
+    let trimmed = tag.trim().strip_prefix('v').unwrap_or(tag.trim());
+    let (core, suffix) = match trimmed.split_once(['-', '+']) {
+        Some((core, rest)) => (core, Some(rest)),
+        None => (trimmed, None),
+    };
+    let base = Version::parse(core)?;
+    let rev = match suffix {
+        Some(rest) => {
+            if rest.is_empty()
+                || !rest
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'+' | b'-'))
+            {
+                return None;
+            }
+            rest.strip_prefix("core-tui.")
+                .and_then(|num| num.split(['.', '-', '+']).next())
+                .and_then(|num| num.parse::<u64>().ok())
+        }
+        None => None,
+    };
+    Some((base, rev))
+}
+
+fn fork_version_is_newer(candidate: &ForkVersion, current: &ForkVersion) -> bool {
+    match candidate.0.cmp(&current.0) {
+        std::cmp::Ordering::Greater => true,
+        std::cmp::Ordering::Less => false,
+        std::cmp::Ordering::Equal => match (candidate.1, current.1) {
+            (Some(c), Some(cur)) => c > cur,
+            (Some(_), None) => true,
+            (None, _) => false,
+        },
+    }
+}
+
+fn current_fork_version() -> ForkVersion {
+    parse_fork_version_tag(&crate::build_info::version())
+        .unwrap_or_else(|| (Version::current(), None))
+}
+
+fn parse_github_release_json(bytes: &[u8]) -> Result<GitHubRelease, String> {
+    let release: GitHubRelease = serde_json::from_slice(bytes)
+        .map_err(|err| format!("failed to parse GitHub release JSON: {err}"))?;
+    if release.draft {
+        return Err("latest GitHub release is marked draft".to_owned());
+    }
+    Ok(release)
+}
+
+fn parse_sha256sums_entry(text: &str, filename: &str) -> Option<String> {
+    for line in text.lines() {
+        let mut parts = line.split_whitespace();
+        let Some(hash) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            continue;
+        };
+        let normalized_name = name.trim_start_matches("./").trim_start_matches('*');
+        if normalized_name == filename
+            && hash.len() == 64
+            && hash.bytes().all(|b| b.is_ascii_hexdigit())
+        {
+            return Some(hash.to_ascii_lowercase());
+        }
+    }
+    None
+}
+
+fn fetch_fork_latest_release(timeout_secs: u64) -> Result<GitHubRelease, String> {
+    let max_time = timeout_secs.to_string();
+    let connect_timeout = timeout_secs.min(10).to_string();
+    let output = crate::noninteractive_process::curl_command()
+        .args([
+            "-fsSL",
+            "-H",
+            "Accept: application/vnd.github+json",
+            "-H",
+            "User-Agent: herdr-core-tui",
+            "--connect-timeout",
+            &connect_timeout,
+            "--max-time",
+            &max_time,
+            FORK_LATEST_RELEASE_API_URL,
+        ])
+        .output()
+        .map_err(|err| format!("curl failed: {err}"))?;
+    if !output.status.success() {
+        return Err("failed to fetch latest release from GitHub".to_owned());
+    }
+    parse_github_release_json(&output.stdout)
+}
+
+fn check_fork_release_with_cache<F>(
+    cache_path: Option<&Path>,
+    now_ms: u64,
+    fetch: F,
+) -> Option<(String, String)>
+where
+    F: FnOnce() -> Result<GitHubRelease, String>,
+{
+    let cached = cache_path.and_then(load_fork_update_cache).filter(|entry| {
+        now_ms.saturating_sub(entry.checked_ms) < UPDATE_CHECK_CACHE_TTL_MS
+            && parse_fork_version_tag(&entry.tag).is_some()
+    });
+
+    let (tag, body, url) = if let Some(entry) = cached {
+        (entry.tag, entry.body, entry.html_url)
+    } else {
+        let release = fetch().ok()?;
+        let _ = parse_fork_version_tag(&release.tag_name)?;
+        let cache = ForkUpdateCache {
+            tag: release.tag_name.clone(),
+            checked_ms: now_ms,
+            body: release.body.clone(),
+            html_url: release.html_url.clone(),
+        };
+        if let Some(path) = cache_path {
+            store_fork_update_cache(path, &cache);
+        }
+        (release.tag_name, release.body, release.html_url)
+    };
+
+    let candidate = parse_fork_version_tag(&tag)?;
+    if !fork_version_is_newer(&candidate, &current_fork_version()) {
+        return None;
+    }
+
+    let label = tag.trim_start_matches('v').to_owned();
+    let default_url = format!("{FORK_RELEASES_URL}/tag/{tag}");
+    let notes = body
+        .map(|text| text.trim().to_owned())
+        .filter(|text| !text.is_empty())
+        .unwrap_or_else(|| {
+            format!(
+                "### Changed\n- Released `v{label}` at {}.",
+                url.as_deref().unwrap_or(&default_url)
+            )
+        });
+    Some((label, notes))
+}
+
+fn check_fork_release_cached() -> Option<(String, String)> {
+    let cache_path = fork_update_cache_path();
+    check_fork_release_with_cache(cache_path.as_deref(), current_epoch_ms(), || {
+        fetch_fork_latest_release(5)
+    })
+}
+
+fn is_cargo_managed_exe_path(path: &Path) -> bool {
+    let cargo_bin = env::var_os("CARGO_HOME")
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            env::var_os("HOME")
+                .filter(|v| !v.is_empty())
+                .map(|home| PathBuf::from(home).join(".cargo"))
+        })
+        .map(|root| root.join("bin"));
+    let Some(cargo_bin) = cargo_bin else {
+        return false;
+    };
+    let check = |p: &Path| {
+        p.starts_with(&cargo_bin)
+            || cargo_bin
+                .canonicalize()
+                .ok()
+                .is_some_and(|canon| p.starts_with(&canon))
+    };
+    check(path) || path.canonicalize().ok().is_some_and(|canon| check(&canon))
+}
+
+fn is_target_build_exe_path(path: &Path) -> bool {
+    let has_target_build = |p: &Path| {
+        let mut prev_is_target = false;
+        for component in p.components() {
+            let name = component.as_os_str();
+            if prev_is_target && (name == "debug" || name == "release") {
+                return true;
+            }
+            prev_is_target = name == "target";
+        }
+        false
+    };
+    has_target_build(path)
+        || path
+            .canonicalize()
+            .ok()
+            .is_some_and(|p| has_target_build(&p))
+}
+
+fn validate_fork_self_upgrade_target(path: &Path) -> Result<(), String> {
+    if is_homebrew_managed_exe_path_following_links(path) {
+        return Err(format!(
+            "self-update is disabled for Homebrew installs; run `{HOMEBREW_UPDATE_COMMAND}`"
+        ));
+    }
+    if is_mise_managed_exe_path_following_links(path) {
+        return Err(format!(
+            "self-update is disabled for mise installs; run `{MISE_UPDATE_COMMAND}`"
+        ));
+    }
+    if is_nix_store_exe_path_following_links(path) {
+        return Err(
+            "self-update is disabled for Nix installs; update with `nix profile upgrade` or your flake input"
+                .to_owned(),
+        );
+    }
+    if is_cargo_managed_exe_path(path) {
+        return Err(
+            "self-update is disabled for cargo-installed binaries; rebuild with cargo or reinstall via scripts/install.sh"
+                .to_owned(),
+        );
+    }
+    if is_target_build_exe_path(path) {
+        return Err(
+            "self-update is disabled for local target/ builds; run `cargo build --release` instead"
+                .to_owned(),
+        );
+    }
+    Ok(())
+}
+
+struct TempUpgradeDir {
+    path: PathBuf,
+}
+
+impl Drop for TempUpgradeDir {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+fn fork_release_asset_name() -> Result<String, String> {
+    let (os, arch) = platform_target();
+    if os == "unknown" || arch == "unknown" {
+        return Err(format!("unsupported platform for self-update: {os}-{arch}"));
+    }
+    if os == "windows" {
+        Ok(format!("herdr-core-tui-{os}-{arch}.zip"))
+    } else {
+        Ok(format!("herdr-core-tui-{os}-{arch}.tar.gz"))
+    }
+}
+
+/// Self-updates `herdr-core-tui` and its `hc-tui` alias from `lucasliet/herdr-core-tui` releases
+/// without touching `hc` / `herdr-app`.
+pub fn run_fork_upgrade() -> Result<(), String> {
+    let current_exe = env::current_exe().map_err(|e| format!("can't find current binary: {e}"))?;
+    validate_fork_self_upgrade_target(&current_exe)?;
+    if running_inside_herdr() {
+        return Err(format!(
+            "run `{FORK_UPDATE_COMMAND}` outside herdr after detaching from the session"
+        ));
+    }
+
+    eprintln!("checking github.com/lucasliet/herdr-core-tui releases...");
+    let release = fetch_fork_latest_release(20)?;
+    let candidate = parse_fork_version_tag(&release.tag_name)
+        .ok_or_else(|| format!("unrecognized release tag format: {}", release.tag_name))?;
+    let current = current_fork_version();
+    if !fork_version_is_newer(&candidate, &current) {
+        eprintln!(
+            "herdr-core-tui is already up to date ({})",
+            crate::build_info::version()
+        );
+        return Ok(());
+    }
+
+    let asset_name = fork_release_asset_name()?;
+    let archive_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == asset_name)
+        .ok_or_else(|| {
+            format!(
+                "release {} has no asset named {asset_name}",
+                release.tag_name
+            )
+        })?;
+    let sums_asset = release
+        .assets
+        .iter()
+        .find(|asset| asset.name == "SHA256SUMS.txt")
+        .ok_or_else(|| {
+            format!(
+                "release {} has no SHA256SUMS.txt checksum asset",
+                release.tag_name
+            )
+        })?;
+
+    #[cfg(windows)]
+    {
+        let _ = (&archive_asset, &sums_asset);
+        return Err(format!(
+            "Windows self-upgrade via CLI is not yet automated; download {} from {}",
+            asset_name,
+            release.html_url.as_deref().unwrap_or(FORK_RELEASES_URL)
+        ));
+    }
+
+    #[cfg(not(windows))]
+    {
+        let install_dir = current_exe
+            .parent()
+            .ok_or("cannot determine installation directory")?;
+        let test_path = install_dir.join(".herdr-core-tui-write-test");
+        if let Err(err) = fs::write(&test_path, b"") {
+            let _ = fs::remove_file(&test_path);
+            return Err(format!(
+                "install directory is not writable: {} ({err})",
+                install_dir.display()
+            ));
+        }
+        let _ = fs::remove_file(&test_path);
+
+        let sums_output = crate::noninteractive_process::curl_command()
+            .args([
+                "-fsSL",
+                "--connect-timeout",
+                "10",
+                "--max-time",
+                "20",
+                &sums_asset.browser_download_url,
+            ])
+            .output()
+            .map_err(|err| format!("failed to download SHA256SUMS.txt: {err}"))?;
+        if !sums_output.status.success() {
+            return Err("failed to download SHA256SUMS.txt".to_owned());
+        }
+        let sums_text = String::from_utf8_lossy(&sums_output.stdout);
+        let expected_sha256 = parse_sha256sums_entry(&sums_text, &asset_name)
+            .ok_or_else(|| format!("checksum for {asset_name} missing in SHA256SUMS.txt"))?;
+
+        let temp_dir = TempUpgradeDir {
+            path: install_dir.join(format!(".herdr-core-tui-upgrade-{}", std::process::id())),
+        };
+        fs::create_dir_all(&temp_dir.path)
+            .map_err(|err| format!("failed to create staging directory: {err}"))?;
+
+        let archive_path = temp_dir.path.join(&asset_name);
+        eprintln!("downloading {} ({asset_name})...", release.tag_name);
+        let status = crate::noninteractive_process::curl_command()
+            .args(["-fsSL", "--max-time", "120", "-o"])
+            .arg(&archive_path)
+            .arg(&archive_asset.browser_download_url)
+            .status()
+            .map_err(|err| format!("download failed: {err}"))?;
+        if !status.success() {
+            return Err(format!("failed to download {asset_name}"));
+        }
+        crate::checksum::verify_sha256(&archive_path, &expected_sha256)
+            .map_err(|err| format!("checksum verification failed for {asset_name}: {err}"))?;
+
+        let extract_status = Command::new("tar")
+            .args(["-xzf"])
+            .arg(&archive_path)
+            .arg("-C")
+            .arg(&temp_dir.path)
+            .arg("herdr-core-tui")
+            .status()
+            .map_err(|err| format!("failed to extract {asset_name}: {err}"))?;
+        if !extract_status.success() {
+            return Err(format!("tar extraction failed for {asset_name}"));
+        }
+
+        let extracted = temp_dir.path.join("herdr-core-tui");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&extracted, fs::Permissions::from_mode(0o755))
+                .map_err(|err| format!("chmod failed: {err}"))?;
+        }
+
+        let target_main = install_dir.join("herdr-core-tui");
+        let staged_main = install_dir.join(format!(".herdr-core-tui.new.{}", std::process::id()));
+        fs::copy(&extracted, &staged_main)
+            .map_err(|err| format!("failed to stage new binary: {err}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = fs::set_permissions(&staged_main, fs::Permissions::from_mode(0o755));
+        }
+        if let Err(err) = fs::rename(&staged_main, &target_main) {
+            let _ = fs::remove_file(&staged_main);
+            return Err(format!(
+                "failed to install {}: {err}",
+                target_main.display()
+            ));
+        }
+
+        let target_alias = install_dir.join("hc-tui");
+        #[cfg(unix)]
+        {
+            let staged_alias = install_dir.join(format!(".hc-tui.new.{}", std::process::id()));
+            let _ = fs::remove_file(&staged_alias);
+            if std::os::unix::fs::symlink("herdr-core-tui", &staged_alias).is_ok() {
+                if fs::rename(&staged_alias, &target_alias).is_err() {
+                    let _ = fs::remove_file(&staged_alias);
+                }
+            } else {
+                let _ = fs::copy(&target_main, &staged_alias);
+                let _ = fs::rename(&staged_alias, &target_alias);
+            }
+        }
+
+        let label = release.tag_name.trim_start_matches('v').to_owned();
+        if let Some(body) = release
+            .body
+            .as_deref()
+            .map(str::trim)
+            .filter(|b| !b.is_empty())
+        {
+            let _ = crate::release_notes::save_pending(&label, body);
+        }
+        eprintln!(
+            "installed herdr-core-tui and hc-tui {} in {} (`hc` untouched).",
+            release.tag_name,
+            install_dir.display()
+        );
+        Ok(())
     }
 }
 
@@ -1940,7 +2452,7 @@ pub(crate) fn update_install_command() -> &'static str {
     } else if is_nix_managed_install() {
         NIX_UPDATE_COMMAND
     } else {
-        HERDR_UPDATE_COMMAND
+        FORK_UPDATE_COMMAND
     }
 }
 
@@ -1948,6 +2460,9 @@ pub(crate) fn update_install_instruction(install_command: &str) -> String {
     match install_command {
         HERDR_UPDATE_COMMAND => {
             "detach, run `herdr update`, then run Herdr again to reconnect".to_string()
+        }
+        FORK_UPDATE_COMMAND => {
+            "detach, run `herdr-core-tui --upgrade`, then run herdr-core-tui again".to_string()
         }
         HOMEBREW_UPDATE_COMMAND => {
             "detach, run `brew update && brew upgrade herdr`, then run Herdr again to reconnect"
@@ -2098,8 +2613,22 @@ fn mise_install_root_under_named_installs_dir(path: &Path) -> Option<PathBuf> {
     Some(version_dir.to_path_buf())
 }
 
+fn is_managed_binary_name(name: Option<&std::ffi::OsStr>) -> bool {
+    matches!(
+        name.and_then(|s| s.to_str()),
+        Some("herdr" | "herdr-core-tui" | "hc-tui")
+    )
+}
+
+fn is_managed_formula_name(name: Option<&std::ffi::OsStr>) -> bool {
+    matches!(
+        name.and_then(|s| s.to_str()),
+        Some("herdr" | "herdr-core-tui")
+    )
+}
+
 fn mise_tool_version_dir(path: &Path) -> Option<&Path> {
-    if path.file_name()? != "herdr" {
+    if !is_managed_binary_name(path.file_name()) {
         return None;
     }
     let bin_dir = path.parent()?;
@@ -2108,7 +2637,7 @@ fn mise_tool_version_dir(path: &Path) -> Option<&Path> {
     }
     let version_dir = bin_dir.parent()?;
     let tool_dir = version_dir.parent()?;
-    if tool_dir.file_name()? != "herdr" {
+    if !is_managed_formula_name(tool_dir.file_name()) {
         return None;
     }
     Some(version_dir)
@@ -2133,7 +2662,7 @@ fn is_homebrew_managed_exe_path(path: &Path) -> bool {
 }
 
 fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
-    if path.file_name()? != "herdr" {
+    if !is_managed_binary_name(path.file_name()) {
         return None;
     }
     let bin_dir = path.parent()?;
@@ -2142,7 +2671,7 @@ fn homebrew_cellar_keg_root(path: &Path) -> Option<PathBuf> {
     }
     let version_dir = bin_dir.parent()?;
     let formula_dir = version_dir.parent()?;
-    if formula_dir.file_name()? != "herdr" {
+    if !is_managed_formula_name(formula_dir.file_name()) {
         return None;
     }
     let cellar_dir = formula_dir.parent()?;
@@ -2474,34 +3003,24 @@ pub fn auto_update(events: tokio::sync::mpsc::Sender<crate::events::AppEvent>) {
         return;
     }
 
-    let release = match check_latest() {
-        Ok(Some(r)) => r,
-        Ok(None) => return,
-        Err(err) => {
-            crate::logging::update_check_failed(&err);
-            return;
-        }
+    if is_update_check_opted_out() {
+        tracing::debug!("skipping startup update check due to opt-out env var");
+        return;
+    }
+
+    let Some((version_label, notes_body)) = check_fork_release_cached() else {
+        return;
     };
 
-    crate::logging::update_available(release.label());
-    tracing::info!(
-        "new {} build available at {}",
-        release.channel.as_str(),
-        release.download_url
-    );
+    crate::logging::update_available(&version_label);
+    tracing::info!("new herdr-core-tui release available: {version_label}");
 
-    if let Err(e) = crate::release_notes::save_pending(release.label(), &release.notes_body) {
+    if let Err(e) = crate::release_notes::save_pending(&version_label, &notes_body) {
         tracing::warn!("failed to save pending release notes: {e}");
     }
 
-    tracing::info!(
-        "auto-update check: {} available, waiting for explicit install",
-        release.label()
-    );
-
-    // Notify the TUI — blocking_send is safe from a std::thread
     let _ = events.blocking_send(crate::events::AppEvent::UpdateReady {
-        version: release.label().to_string(),
+        version: version_label,
         install_command: update_install_command().to_string(),
     });
 }
@@ -4314,5 +4833,127 @@ mod tests {
                     .is_some_and(|value| value.len() == 64));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fork_update_tests {
+    use super::*;
+
+    #[test]
+    fn fork_version_tags_order_base_and_suffixes() {
+        let base = parse_fork_version_tag("v0.9.5").unwrap();
+        let rev1 = parse_fork_version_tag("v0.9.5-core-tui.1").unwrap();
+        let rev2 = parse_fork_version_tag("v0.9.5-core-tui.2").unwrap();
+        let next = parse_fork_version_tag("v0.9.6").unwrap();
+
+        assert!(fork_version_is_newer(&rev1, &base));
+        assert!(fork_version_is_newer(&rev2, &rev1));
+        assert!(fork_version_is_newer(&next, &rev2));
+        assert!(!fork_version_is_newer(&base, &rev1));
+        assert!(!fork_version_is_newer(&rev1, &rev1));
+        assert!(parse_fork_version_tag("v0.9.5;rm -rf /").is_none());
+    }
+
+    #[test]
+    fn parses_github_release_and_sha256sums_offline() {
+        let json = serde_json::json!({
+            "tag_name": "v9.9.9-core-tui.1",
+            "body": "### Added\n- Remote waiting",
+            "html_url": "https://github.com/lucasliet/herdr-core-tui/releases/tag/v9.9.9-core-tui.1",
+            "draft": false,
+            "assets": [
+                {
+                    "name": "herdr-core-tui-macos-aarch64.tar.gz",
+                    "browser_download_url": "https://example.invalid/a.tar.gz"
+                },
+                {
+                    "name": "SHA256SUMS.txt",
+                    "browser_download_url": "https://example.invalid/SHA256SUMS.txt"
+                }
+            ]
+        })
+        .to_string();
+        let parsed = parse_github_release_json(json.as_bytes()).unwrap();
+        assert_eq!(parsed.tag_name, "v9.9.9-core-tui.1");
+        assert_eq!(parsed.assets.len(), 2);
+
+        let sums = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  herdr-core-tui-macos-aarch64.tar.gz\n";
+        assert_eq!(
+            parse_sha256sums_entry(sums, "herdr-core-tui-macos-aarch64.tar.gz").as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+        );
+        assert!(parse_sha256sums_entry(sums, "missing.tar.gz").is_none());
+    }
+
+    #[test]
+    fn fresh_cache_prevents_fetch_and_expired_cache_refetches() {
+        let dir = TempUpgradeDir {
+            path: std::env::temp_dir()
+                .join(format!("herdr-fork-cache-test-{}", std::process::id())),
+        };
+        let _ = fs::remove_dir_all(&dir.path);
+        fs::create_dir_all(&dir.path).unwrap();
+        let cache_path = dir.path.join("update-check.json");
+        let now = 1_000_000_000_u64;
+        store_fork_update_cache(
+            &cache_path,
+            &ForkUpdateCache {
+                tag: "v9.9.9".into(),
+                checked_ms: now - 1_000,
+                body: Some("### Notes\n- Cached body".into()),
+                html_url: None,
+            },
+        );
+        let mut called = false;
+        let hit = check_fork_release_with_cache(Some(&cache_path), now, || {
+            called = true;
+            Err("must not fetch".into())
+        });
+        assert!(!called);
+        assert_eq!(
+            hit,
+            Some(("9.9.9".into(), "### Notes\n- Cached body".into()))
+        );
+
+        // Expired TTL -> invokes fetcher and updates cache.
+        let later = now + UPDATE_CHECK_CACHE_TTL_MS + 5_000;
+        let hit2 = check_fork_release_with_cache(Some(&cache_path), later, || {
+            Ok(GitHubRelease {
+                tag_name: "v9.9.10".into(),
+                body: Some("Fresh body".into()),
+                html_url: None,
+                draft: false,
+                assets: Vec::new(),
+            })
+        });
+        assert_eq!(hit2, Some(("9.9.10".into(), "Fresh body".into())));
+    }
+
+    #[test]
+    fn self_upgrade_refuses_target_builds_and_package_managers() {
+        assert!(validate_fork_self_upgrade_target(Path::new(
+            "/workspace/target/release/herdr-core-tui"
+        ))
+        .unwrap_err()
+        .contains("target/"));
+        assert!(validate_fork_self_upgrade_target(Path::new(
+            "/opt/homebrew/Cellar/herdr-core-tui/0.9.5/bin/herdr-core-tui"
+        ))
+        .unwrap_err()
+        .contains("Homebrew"));
+        assert!(validate_fork_self_upgrade_target(Path::new(
+            "/home/user/.local/share/mise/installs/herdr-core-tui/0.9.5/bin/herdr-core-tui"
+        ))
+        .unwrap_err()
+        .contains("mise"));
+        assert!(validate_fork_self_upgrade_target(Path::new(
+            "/nix/store/0000-herdr-core-tui/bin/herdr-core-tui"
+        ))
+        .unwrap_err()
+        .contains("Nix"));
+        assert!(
+            validate_fork_self_upgrade_target(Path::new("/usr/local/bin/herdr-core-tui")).is_ok()
+        );
     }
 }

@@ -67,6 +67,7 @@ pub(crate) enum KeybindAction {
     Help,
     Settings,
     ReloadConfig,
+    Update,
     OpenNotificationTarget,
     Detach,
     OpenNavigator,
@@ -148,6 +149,7 @@ pub(crate) fn resolve_non_indexed_action(
         (&keybinds.resize_pane_right, KeybindAction::ResizePaneRight),
         (&keybinds.toggle_sidebar, KeybindAction::ToggleSidebar),
         (&keybinds.reload_config, KeybindAction::ReloadConfig),
+        (&keybinds.update, KeybindAction::Update),
         (
             &keybinds.open_notification_target,
             KeybindAction::OpenNotificationTarget,

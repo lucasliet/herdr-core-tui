@@ -21,8 +21,10 @@ This fork turns the classic `herdr` Rust/Ratatui + `libghostty-vt` terminal work
 ## What this fork is (and is not)
 
 - **It is a TUI frontend for `herdr-core` (`hc`):** workspaces, tabs, pane splits, live PTY streams, agent status updates (OSC 7501 via `hc`), and remote SSH machines are owned by `hc` and synchronized through the shared `"herdr-app"` Automerge document.
+- **Remote SSH & agent status parity:** attach directly over SSH via `--remote <target>`, bridge clipboard images (`Ctrl+V`) to remote and SSH terminals over `hc terminal.put`, see presentation-only `◌ waiting` background-shell activity, and use per-tab persistent floating popup terminals (`persistent = true` or bare interactive shells on `[[keys.command]]` with `type = "popup"`).
 - **Bidirectional parity with `herdr-app`:** changes you make in `herdr-app` (workspaces, tabs, layouts, local/remote machines) appear dynamically in `herdr-core-tui`, and changes you make in `herdr-core-tui` sync back to `herdr-app`.
-- **Does not conflict with or overwrite `hc`, `herdr-app`, or legacy `herdr`:** installed binaries are named `herdr-core-tui` and `hc-tui` (never `herdr` or `hc`), and `update` will never overwrite your existing `hc` installation.
+- **Self-update from fork releases:** startup checks GitHub Releases on `lucasliet/herdr-core-tui` (cached for 24h; opt out via `update.version_check = false` or `HC_TUI_NO_UPDATE_CHECK=1`), `prefix+u` opens release notes, and `herdr-core-tui --upgrade` upgrades in place with `SHA256SUMS.txt` verification (package-manager and `target/` builds are safely refused).
+- **Does not conflict with or overwrite `hc`, `herdr-app`, or legacy `herdr`:** installed binaries are named `herdr-core-tui` and `hc-tui` (never `herdr` or `hc`), and `--upgrade` / `update` will never overwrite your existing `hc` installation.
 - **No legacy `integrations` installer/hooks:** legacy TUI hook management and the settings `integrations` tab were removed; agent lifecycle and status detection rely directly on `hc`.
 - **No standalone legacy server required:** instead of maintaining a separate legacy `herdr` server/socket state, sessions live inside `hc`.
 
@@ -55,7 +57,13 @@ Tagging `v*` (or running the Release workflow manually) publishes fork release a
   - `herdr-core-tui-windows-x86_64.zip` (contains `herdr-core-tui.exe`, `hc-tui.exe`, and the pinned Microsoft ConPTY runtime)
 - **Checksums:** `SHA256SUMS.txt`
 
-Example install from a `.tar.gz` release archive:
+Example install using the installer script (downloads from GitHub Releases and verifies `SHA256SUMS.txt` into `~/.local/bin` without touching `hc`):
+
+```sh
+./scripts/install.sh
+```
+
+Or manually from a `.tar.gz` release archive:
 
 ```bash
 tar -xzf herdr-core-tui-macos-aarch64.tar.gz -C ~/.local/bin

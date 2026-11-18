@@ -89,15 +89,22 @@ impl ClientShellState {
         } else {
             ClientShellMode::Navigate
         };
-        self.push_endpoint_method_with_kind(
-            crate::api::schema::Method::ReleaseNotesDismiss(
-                crate::api::schema::ReleaseNotesDismissParams {
-                    version: notes.version.clone(),
-                },
-            ),
-            PendingEndpointKind::ReleaseNotesDismiss,
-            outcome,
-        );
+        let is_server_release_notes = self
+            .snapshot
+            .as_deref()
+            .and_then(|snapshot| snapshot.release_notes.as_ref())
+            .is_some_and(|server_notes| server_notes.version == notes.version);
+        if is_server_release_notes {
+            self.push_endpoint_method_with_kind(
+                crate::api::schema::Method::ReleaseNotesDismiss(
+                    crate::api::schema::ReleaseNotesDismissParams {
+                        version: notes.version.clone(),
+                    },
+                ),
+                PendingEndpointKind::ReleaseNotesDismiss,
+                outcome,
+            );
+        }
         outcome.repaint = true;
     }
 

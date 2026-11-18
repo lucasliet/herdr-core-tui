@@ -80,6 +80,31 @@ impl ClientShellState {
                     outcome.resize = true;
                     return;
                 }
+                if action == crate::input::KeybindAction::Update {
+                    if self
+                        .snapshot
+                        .as_deref()
+                        .and_then(|snapshot| snapshot.release_notes.as_ref())
+                        .is_some()
+                    {
+                        self.open_release_notes();
+                    } else {
+                        let current = crate::build_info::version();
+                        self.overlay = Some(ClientShellOverlay::ReleaseNotes(
+                            crate::app::state::ReleaseNotesState {
+                                version: current.to_owned(),
+                                body: format!(
+                                    "### herdr-core-tui\n- Running `v{current}` (`https://github.com/lucasliet/herdr-core-tui`).\n- No newer release is currently pending.\n- Run `herdr-core-tui --upgrade` outside a session to check or install updates without affecting `hc`."
+                                ),
+                                scroll: 0,
+                                preview: false,
+                            },
+                        ));
+                        self.chrome_drag = None;
+                    }
+                    outcome.repaint = true;
+                    return;
+                }
                 if action == crate::input::KeybindAction::NewWorkspace {
                     self.trigger_new_workspace_for_machine(None, outcome);
                     return;
