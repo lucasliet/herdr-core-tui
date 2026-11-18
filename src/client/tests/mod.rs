@@ -1061,3 +1061,11 @@ fn terminal_control_scroll_command_maps_to_attach_scroll() {
     assert_eq!(direction, AttachScrollDirection::Up);
     assert_eq!(lines, 3);
 }
+
+#[test]
+fn hc_backed_client_skips_legacy_ssh_endpoint_catalog() {
+    assert!(!should_use_legacy_ssh_catalog(true, false, true));
+    assert!(!should_use_legacy_ssh_catalog(true, true, false));
+    assert!(!should_use_legacy_ssh_catalog(false, false, false));
+    assert!(should_use_legacy_ssh_catalog(true, false, false));
+}

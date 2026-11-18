@@ -174,6 +174,17 @@ use crate::protocol::{self, ClientMessage, ServerMessage, MAX_GRAPHICS_FRAME_SIZ
 use crate::protocol::{AttachScrollDirection, AttachScrollSource, NotifyKind};
 use crate::server::socket_paths::client_socket_path;
 
+/// Decides whether this client session should load and watch the legacy SSH
+/// `EndpointCatalog` (`endpoints.json`). Sessions backed by `hc` already track
+/// remote machines natively via `hc_machines` and `hc_sidebar`.
+fn should_use_legacy_ssh_catalog(
+    client_rendered_shell: bool,
+    remote_client_process: bool,
+    hc_backed: bool,
+) -> bool {
+    client_rendered_shell && !remote_client_process && !hc_backed
+}
+
 /// The decoder for whichever optional surface encodings this connection negotiated.
 fn negotiated_surface_decoder(
     negotiation: &endpoint::EndpointNegotiation,
@@ -244,7 +255,12 @@ fn run_client_with_mode(
     crate::logging::startup("client");
     info!(path = %socket_path.display(), "{log_message}");
 
-    let endpoint_catalog = if client_rendered_shell && !is_remote_client_process() {
+    let hc_backed = crate::hc::global_core().is_some();
+    let endpoint_catalog = if should_use_legacy_ssh_catalog(
+        client_rendered_shell,
+        is_remote_client_process(),
+        hc_backed,
+    ) {
         endpoint::EndpointCatalog::load().unwrap_or_else(|error| {
             warn!(%error, "saved SSH endpoint catalog is unavailable");
             endpoint::EndpointCatalog::default()
@@ -676,7 +692,10 @@ async fn run_client_loop(
     let mut pending_activation: Option<endpoint::PendingEndpointActivation> = None;
     let mut scheduled_activation = None;
     let mut pending_catalog: Option<Result<Vec<endpoint::SavedSshEndpoint>, String>> = None;
-    if state.shell.is_some() && !is_remote_client && state.attach_escape.is_none() {
+    let hc_backed = crate::hc::global_core().is_some();
+    if should_use_legacy_ssh_catalog(state.shell.is_some(), is_remote_client, hc_backed)
+        && state.attach_escape.is_none()
+    {
         catalog_reload::watch_profiles(event_tx.clone(), should_quit.clone());
     }
 

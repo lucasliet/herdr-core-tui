@@ -1124,9 +1124,10 @@ pub fn restore_from_hc(
         };
 
         let existing_ws = labeled_space.as_deref().and_then(|space_id| {
-            workspaces
-                .iter_mut()
-                .find(|ws| get_space_id(&ws.id).as_deref() == Some(space_id))
+            workspaces.iter_mut().find(|ws| {
+                get_space_id(&ws.id).as_deref() == Some(space_id)
+                    && get_workspace_machine(&ws.id) == machine
+            })
         });
 
         if let Some(ws) = existing_ws {
@@ -1526,12 +1527,10 @@ fn find_workspace_for_doc_space(
     space: &SharedSpace,
     space_machine: Option<&str>,
 ) -> Option<usize> {
-    if let Some(idx) = app
-        .state
-        .workspaces
-        .iter()
-        .position(|ws| get_space_id(&ws.id).as_deref() == Some(space.id.as_str()))
-    {
+    if let Some(idx) = app.state.workspaces.iter().position(|ws| {
+        get_space_id(&ws.id).as_deref() == Some(space.id.as_str())
+            && get_workspace_machine(&ws.id).as_deref() == space_machine
+    }) {
         return Some(idx);
     }
     for shared_tab in &space.tabs {
@@ -1795,7 +1794,10 @@ fn reconcile_hc_docs_into_app(
     for (ws_idx, space_id, machine, maybe_name) in pending_ws_updates {
         if let Some(ws) = app.state.workspaces.get_mut(ws_idx) {
             set_space_id(&ws.id, space_id);
-            set_workspace_machine(&ws.id, machine);
+            if get_workspace_machine(&ws.id) != machine {
+                set_workspace_machine(&ws.id, machine);
+                dirty = true;
+            }
             if let Some(name) = maybe_name {
                 set_workspace_raw_name(&ws.id, name.clone());
                 let fallback = fallback_label_from_cwd(&ws.identity_cwd);
@@ -1883,16 +1885,17 @@ fn adopt_unmapped_hc_terminal(app: &mut App, info: &Value) -> bool {
 
     let labeled_space = terminal_label_str(info, "herdr.space").map(str::to_owned);
     let labeled_tab = terminal_label_str(info, "herdr.tab").map(str::to_owned);
+    let machine = machine_of_address(addr).map(str::to_owned);
     let moved = MovedPane {
         pane_id,
         pane_state: PaneState::new(terminal_id),
     };
 
     let matching_ws = labeled_space.as_deref().and_then(|space_id| {
-        app.state
-            .workspaces
-            .iter_mut()
-            .find(|ws| get_space_id(&ws.id).as_deref() == Some(space_id))
+        app.state.workspaces.iter_mut().find(|ws| {
+            get_space_id(&ws.id).as_deref() == Some(space_id)
+                && get_workspace_machine(&ws.id) == machine
+        })
     });
 
     if let Some(ws) = matching_ws {
@@ -1911,7 +1914,6 @@ fn adopt_unmapped_hc_terminal(app: &mut App, info: &Value) -> bool {
         }
     } else {
         let raw_name = fallback_label_from_cwd(&cwd);
-        let machine = machine_of_address(addr).map(str::to_owned);
         let ws = Workspace::from_existing_pane(
             None,
             None,
@@ -2403,6 +2405,59 @@ mod tests {
         assert_eq!(
             app.pane_metadata(0, pane_id).unwrap().agent_status,
             crate::api::schema::AgentStatus::Done
+        );
+        super::super::client::reset_registry();
+    }
+
+    #[test]
+    fn remote_doc_matching_does_not_merge_into_local_workspace_on_space_id_collision() {
+        let _guard = registry_test_guard();
+        super::super::client::reset_registry();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let local_ws = Workspace::test_new("~");
+        let local_id = local_ws.id.clone();
+        set_space_id(&local_id, "shared_collision".into());
+        set_workspace_machine(&local_id, None);
+        app.state.workspaces.push(local_ws);
+
+        let remote_space = SharedSpace {
+            id: "shared_collision".into(),
+            name: "ubuntu".into(),
+            folder: "/home/ubuntu".into(),
+            tabs: vec![SharedTab {
+                id: "tab_remote".into(),
+                name: "Tab 1".into(),
+                root: HcNode::terminal_block("p_remote", "t2"),
+                rest: Default::default(),
+            }],
+            rest: Default::default(),
+        };
+
+        assert_eq!(
+            find_workspace_for_doc_space(&app, &remote_space, None),
+            Some(0)
+        );
+        assert_eq!(
+            find_workspace_for_doc_space(&app, &remote_space, Some("oracle")),
+            None
+        );
+
+        let oracle_ws = Workspace::test_new("ubuntu");
+        let oracle_id = oracle_ws.id.clone();
+        set_space_id(&oracle_id, "shared_collision".into());
+        set_workspace_machine(&oracle_id, Some("oracle".into()));
+        app.state.workspaces.push(oracle_ws);
+
+        assert_eq!(
+            find_workspace_for_doc_space(&app, &remote_space, Some("oracle")),
+            Some(1)
         );
         super::super::client::reset_registry();
     }
