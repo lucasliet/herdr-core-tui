@@ -252,6 +252,7 @@ pub(super) struct ShellRenderState<'a> {
     pub(super) reveal_navigation_workspace: &'a mut bool,
     pub(super) dragged_workspace_id: Option<&'a str>,
     pub(super) workspace_drop_indicator_row: Option<u16>,
+    pub(super) right_panel: &'a super::right_panel::RightPanelState,
 }
 
 pub(super) fn render_shell(
@@ -313,6 +314,16 @@ pub(super) fn render_shell(
             );
         }
     }
+    if layout.right_panel.width > 0 && layout.right_panel.height > 0 {
+        super::right_panel::render_right_panel(
+            buffer,
+            layout.right_panel,
+            state.right_panel,
+            &config.palette,
+            config.mouse_capture,
+            &mut hits,
+        );
+    }
     if layout.tab_bar.height > 0 {
         render_tab_bar(
             buffer,
@@ -322,6 +333,7 @@ pub(super) fn render_shell(
             state.tab_scroll,
             state.reveal_focused_tab,
             state.tab_drag_insert_index,
+            state.right_panel.active_tab,
             &mut hits,
         );
     }
@@ -340,6 +352,12 @@ pub(super) fn render_shell(
         hits.tab_scroll_left = Rect::default();
         hits.tab_scroll_right = Rect::default();
         hits.new_tab = Rect::default();
+        hits.tab_bar_files_button = Rect::default();
+        hits.tab_bar_changes_button = Rect::default();
+        hits.right_panel_divider = Rect::default();
+        hits.right_panel_close = Rect::default();
+        hits.right_panel_refresh = Rect::default();
+        hits.right_panel_rows.clear();
         hits.pane_splits.clear();
     }
     hits

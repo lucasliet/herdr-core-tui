@@ -278,20 +278,22 @@ pub(crate) fn probe_plan_from_info(info: &Value) -> Option<ProbePlan> {
         return None;
     }
     let address = info.get("address").and_then(Value::as_str)?.to_owned();
-    let word = match info.pointer("/status/state").and_then(Value::as_str)? {
-        "idle" => "idle",
-        "done" => "done",
-        _ => return None,
+    let app = super::sync::status_agent_label(info).or_else(|| {
+        super::sync::foreground_detected_agent(info)
+            .map(|agent| crate::detect::agent_label(agent).to_owned())
+    });
+    let word = match info.pointer("/status/state").and_then(Value::as_str) {
+        Some("idle") => "idle",
+        Some("done") => "done",
+        Some(_) => return None,
+        None => {
+            super::sync::foreground_detected_agent(info)?;
+            "idle"
+        }
     };
     let pid_i64 = info.pointer("/foreground/pid").and_then(Value::as_i64)?;
     let pid = i32::try_from(pid_i64).ok()?;
     let created_ms = info.get("created_ms").and_then(Value::as_u64).unwrap_or(0);
-    let app = info
-        .pointer("/status/label")
-        .and_then(Value::as_str)
-        .or_else(|| info.pointer("/foreground/program").and_then(Value::as_str))
-        .or_else(|| info.pointer("/labels/herdr.agent").and_then(Value::as_str))
-        .map(str::to_owned);
     let layer2 = app.as_deref().and_then(|name| layer2_for(name, word));
     let machine = super::sync::machine_of_address(&address).map(str::to_owned);
 

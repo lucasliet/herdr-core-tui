@@ -323,10 +323,14 @@ struct InprocessEnvGuard {
     prev_hc_remote_client: Option<std::ffi::OsString>,
     prev_remote_prefs: Option<std::ffi::OsString>,
     temp_dir: PathBuf,
+    #[cfg(unix)]
+    canonical_api_symlink: Option<(PathBuf, PathBuf)>,
 }
 
 impl Drop for InprocessEnvGuard {
     fn drop(&mut self) {
+        #[cfg(unix)]
+        remove_canonical_api_symlink(self.canonical_api_symlink.as_ref());
         match &self.prev_api_socket {
             Some(val) => std::env::set_var(crate::api::SOCKET_PATH_ENV_VAR, val),
             None => std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR),
@@ -402,7 +406,8 @@ pub fn auto_detect_launch(saved_federation: bool, remote_target: Option<&str>) -
     let client_sock = temp_dir.join("herdr-client.sock");
 
     crate::session::clear_explicit_session_override();
-    let _env_guard = InprocessEnvGuard {
+    let canonical_api_sock = crate::session::api_socket_path_for(hc_session.as_deref());
+    let mut _env_guard = InprocessEnvGuard {
         prev_api_socket: std::env::var_os(crate::api::SOCKET_PATH_ENV_VAR),
         prev_client_socket: std::env::var_os(
             crate::server::socket_paths::CLIENT_SOCKET_PATH_ENV_VAR,
@@ -411,6 +416,8 @@ pub fn auto_detect_launch(saved_federation: bool, remote_target: Option<&str>) -
         prev_hc_remote_client: std::env::var_os(crate::hc::client::HC_REMOTE_CLIENT_ENV),
         prev_remote_prefs: std::env::var_os(crate::remote::REMOTE_PREFERENCES_ENV_VAR),
         temp_dir: temp_dir.clone(),
+        #[cfg(unix)]
+        canonical_api_symlink: None,
     };
     if let Some(target) = remote_target {
         std::env::set_var(crate::hc::client::HC_REMOTE_CLIENT_ENV, "1");
@@ -477,6 +484,12 @@ pub fn auto_detect_launch(saved_federation: bool, remote_target: Option<&str>) -
         return Err(err);
     }
 
+    #[cfg(unix)]
+    if canonical_api_sock != api_sock {
+        _env_guard.canonical_api_symlink =
+            expose_canonical_api_symlink(&canonical_api_sock, &api_sock);
+    }
+
     let client_result = crate::client::run_client();
 
     server_stop.request(crate::server::shutdown::ShutdownReason::ApiStop {
@@ -490,6 +503,32 @@ pub fn auto_detect_launch(saved_federation: bool, remote_target: Option<&str>) -
     crate::hc::reset_registry();
 
     client_result
+}
+
+#[cfg(unix)]
+fn expose_canonical_api_symlink(canonical: &Path, target: &Path) -> Option<(PathBuf, PathBuf)> {
+    if is_server_listening_at(canonical).unwrap_or(false) {
+        return None;
+    }
+    if let Some(parent) = canonical.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if std::fs::symlink_metadata(canonical).is_ok() {
+        let _ = std::fs::remove_file(canonical);
+    }
+    std::os::unix::fs::symlink(target, canonical)
+        .ok()
+        .map(|()| (canonical.to_path_buf(), target.to_path_buf()))
+}
+
+#[cfg(unix)]
+fn remove_canonical_api_symlink(link: Option<&(PathBuf, PathBuf)>) {
+    let Some((canonical, target)) = link else {
+        return;
+    };
+    if std::fs::read_link(canonical).ok().as_ref() == Some(target) {
+        let _ = std::fs::remove_file(canonical);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -832,6 +871,36 @@ test "$sid" = "$$"
         std::env::remove_var(crate::session::SESSION_ENV_VAR);
         std::env::remove_var(crate::api::SOCKET_PATH_ENV_VAR);
         crate::session::clear_explicit_session_for_test();
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn canonical_api_symlink_created_and_cleaned_up() {
+        let dir = unique_test_dir("api-symlink");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("inprocess.sock");
+        let listener = UnixListener::bind(&target).unwrap();
+        let canonical = dir.join("nested").join("herdr.sock");
+
+        let created = expose_canonical_api_symlink(&canonical, &target);
+        assert_eq!(
+            created,
+            Some((canonical.clone(), target.clone())),
+            "should create symlink to listening socket"
+        );
+        assert_eq!(std::fs::read_link(&canonical).unwrap(), target);
+        assert!(is_server_listening_at(&canonical).unwrap());
+        assert_eq!(
+            expose_canonical_api_symlink(&canonical, &target),
+            None,
+            "should not overwrite live canonical socket"
+        );
+
+        remove_canonical_api_symlink(created.as_ref());
+        assert!(std::fs::symlink_metadata(&canonical).is_err());
+
+        drop(listener);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

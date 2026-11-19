@@ -695,6 +695,20 @@ impl HeadlessServer {
 
                 true
             }
+            AppEvent::HcSync { .. } => {
+                let focus_before = self.shell_focus_targets();
+                let focused_tabs_before = self.focused_shell_tabs();
+                self.sync_foreground_client_state();
+                let pane_updates = self.app.handle_internal_event_with_pane_updates(ev);
+                for update in &pane_updates {
+                    self.forward_semantic_agent_notification(update);
+                    self.forward_pane_state_update_notifications_to_clients(update);
+                }
+                self.reconcile_client_shell_locations();
+                self.finish_shell_location_reconciliation(focus_before, &focused_tabs_before);
+                self.reapply_controlled_shell_tab_geometry(false);
+                true
+            }
             _ => self.app.handle_internal_event_with_render_impact(ev),
         }
     }

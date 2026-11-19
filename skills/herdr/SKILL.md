@@ -1,46 +1,56 @@
 ---
 name: herdr
-description: "Control Herdr, a terminal multiplexer for coding agents. Use only when the user explicitly mentions Herdr or asks to use Herdr to inspect or control panes, tabs, workspaces, commands, or another agent. Do not use merely because a task could benefit from a background terminal, delegation, or parallel work. Requires HERDR_ENV=1."
+description: "Control hc-tui (herdr-core-tui), the terminal UI frontend for herdr-core (hc). Use only when the user explicitly mentions Herdr, hc-tui, or asks to inspect or control TUI workspaces, tabs, panes, or agents. For raw terminal/agent lifecycle or remote host commands, read `hc --skill` and use `hc`."
 ---
 
-# Herdr
+# hc-tui (`herdr-core-tui`)
 
-Herdr organizes terminals into workspaces, tabs, and panes, recognizes coding agents running inside panes, and exposes the current session through the `herdr` CLI.
+`hc` (`herdr-core`) runs terminals, coding agents, and SSH machine connections and keeps them alive when any frontend closes. `hc-tui` (`herdr-core-tui`) is the terminal UI frontend on top of `hc`: it organizes panes into workspaces, tabs, splits, worktrees, agent status panels, notifications, and the collapsible right-hand **Files** / **Changes** panel.
 
-Before issuing any control command, verify that this agent is running inside a Herdr-managed pane:
+Before issuing any control command, verify that this shell is running inside a Herdr / `hc`-managed terminal:
 
 ```bash
-test "${HERDR_ENV:-}" = 1
+test -n "${HC_TERMINAL_ID:-}" || test "${HERDR_ENV:-}" = 1
 ```
 
-If the check fails, say that you are not running inside Herdr and stop. Do not inspect or control the focused Herdr session from outside Herdr.
+If the check fails, say that you are not running inside a `hc` / `hc-tui` terminal and stop.
 
-When the check passes, the `herdr` binary in `PATH` talks to the current session. Use it to inspect neighboring work, create terminal layout, start agents and commands, read output, and wait for state changes.
+## Choose between `hc` and `hc-tui`
+
+- Use **`hc`** (`hc --skill`) to spawn, read, send input to, wait on, or kill underlying terminals and coding agents, or execute commands on remote machines (`hc ls`, `hc get "$HC_TERMINAL_ID"`, `hc exec --on <machine>`, `hc run`). `$HC_TERMINAL_ID` is your `hc` terminal address (not a TUI pane ID).
+- Use **`hc-tui`** to inspect or drive the active `hc-tui` session layout (workspaces, tabs, splits, worktrees, agent focus, TUI notifications). Note: `hc-tui <command>` talks to a running `hc-tui` instance via its API socket (`hc-tui status`). When using `herdr-app` (desktop GUI) rather than `hc-tui`, run `herdr-app --skill`.
 
 ## Learn the current CLI
 
 The installed binary is the authority for command syntax. Start with:
 
 ```bash
-herdr --help
+hc-tui --help
 ```
 
-Then print the relevant command group by running the group without a subcommand:
+Then inspect the relevant subcommand group by running it without arguments:
 
 ```bash
-herdr agent
-herdr pane
-herdr workspace
-herdr tab
-herdr worktree
-herdr terminal
-herdr notification
-herdr integration
-herdr session
-herdr machine
+hc-tui status
+hc-tui agent
+hc-tui pane
+hc-tui workspace
+hc-tui tab
+hc-tui worktree
+hc-tui terminal
+hc-tui notification
+hc-tui session
+hc-tui machine
+hc-tui config
+hc-tui channel
 ```
 
-Do not run bare `herdr` for discovery; it launches or attaches the TUI. Do not probe a mutating nested command by omitting arguments. Commands such as `herdr workspace create` are valid with defaults and will execute.
+Do not run bare `hc-tui` for discovery: without arguments it launches and attaches the TUI. Do not probe mutating subcommands such as `hc-tui workspace create` without arguments. Other useful launch/maintenance commands:
+
+```bash
+hc-tui --remote <ssh-target> [--session <name>]   # attach TUI to a remote hc server
+hc-tui upgrade                                     # or `hc-tui update` / `hc-tui --upgrade`
+```
 
 Most control commands return JSON. Read identifiers and state from those responses instead of predicting them.
 
@@ -48,167 +58,117 @@ Most control commands return JSON. Read identifiers and state from those respons
 
 Choose the primitive that matches the job:
 
-- Workspace, tab, and pane topology organize terminal locations.
+- Workspace, tab, and pane topology organize terminal locations (plus the right-hand collapsible **Files** and **Changes** panel in the tab bar for inspecting local or remote `hc` repository trees and diffs).
 - Pane commands control raw terminals, shells, tests, servers, input, and output.
 - Agent commands control the recognized coding agent currently occupying a pane.
 
-A pane exists whether or not it contains an agent. `agent start` requires an existing available shell pane and never creates, splits, or moves layout. Use pane commands for ordinary processes. Use agent commands when Herdr must validate agent identity or interpret `idle`, `working`, `blocked`, `done`, and `unknown` lifecycle states.
+A pane exists whether or not it contains an agent. `agent start` requires an existing available shell pane and never creates, splits, or moves layout. Use pane commands for ordinary processes. Use agent commands when `hc-tui` must validate agent identity or interpret `idle`, `working`, `blocked`, `done`, and `unknown` lifecycle states.
 
-Agent commands accept either a unique live agent name or the pane ID currently hosting that agent. They do not accept terminal IDs or bare agent-kind labels. Names must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents. A name follows the current pane occupant and is cleared when that agent exits, is released, or is replaced. Suspending an agent with Ctrl+Z and running a non-agent command preserves its identity while the exact process remains alive. This does not preserve the original identity across another recognized agent taking over. A retained identity does not mean the agent is in the foreground; inspect the pane before sending input.
+Agent commands accept either a unique live agent name or the pane ID currently hosting that agent. They do not accept terminal IDs (`$HC_TERMINAL_ID`) or bare agent-kind labels. Names must match `[a-z][a-z0-9_-]{0,31}` and be unique among live agents. A name follows the current pane occupant and is cleared when that agent exits, is released, or is replaced. Suspending an agent with Ctrl+Z and running a non-agent command preserves its identity while the exact process remains alive. This does not preserve the original identity across another recognized agent taking over. A retained identity does not mean the agent is in the foreground; inspect the pane before sending input.
 
 `idle` and `done` normally indicate the agent is ready for input; neither guarantees that an unfamiliar approval dialog was recognized or that a retained agent is in the foreground. The CLI/API uses the server's seen state to distinguish them; explicit focus commands mark the target seen, while reads do not. Each TUI client tracks viewed completions independently, so its Done badge can differ from the CLI or another client's badge. Antigravity and Grok can be idle while background tasks or subagents keep running, so a settled-state wait is not proof those jobs have finished. `blocked` means Herdr recognized an approval or question UI. `unknown` means an agent is present but Herdr cannot classify it confidently; it does not prove completion.
 
 ## Use IDs and caller context
 
-Public IDs are opaque stable handles:
+Public TUI IDs are opaque stable handles:
 
 - workspace: `w1`
 - tab: `w1:t1`
 - pane: `w1:p1`
 
-Closed tab and pane IDs are not reused. A pane moved into another workspace receives a new workspace-qualified pane ID. After `pane move`, continue with `.result.move_result.pane.pane_id` or the live agent name. The old value is reported as `.result.move_result.previous_pane_id`; only the moved process's inherited caller context keeps resolving that old ID, so do not use it as a general agent target.
-
-Herdr injects the caller's context into each managed pane:
+Closed tab and pane IDs are not reused. A pane moved into another workspace receives a new workspace-qualified pane ID (`w2:p1`). Check `$HERDR_WORKSPACE_ID`, `$HERDR_TAB_ID`, `$HERDR_PANE_ID`, and `$HC_TERMINAL_ID`:
 
 ```bash
-printf '%s\n' "$HERDR_WORKSPACE_ID" "$HERDR_TAB_ID" "$HERDR_PANE_ID"
+printf 'ws=%s tab=%s pane=%s hc=%s\n' "${HERDR_WORKSPACE_ID:-}" "${HERDR_TAB_ID:-}" "${HERDR_PANE_ID:-}" "${HC_TERMINAL_ID:-}"
 ```
 
-Prefer `--current` when a pane command should target the calling pane. An omitted `pane split` target uses the calling pane when `HERDR_PANE_ID` is available, otherwise the focused pane. Other commands may use the UI-focused pane, which can belong to the user or another client.
-
-Discover live state with:
+In `hc`-managed panes, `$HC_TERMINAL_ID` is set even when `$HERDR_PANE_ID` is absent; discover live TUI IDs first with:
 
 ```bash
-herdr workspace list
-herdr tab list --workspace "$HERDR_WORKSPACE_ID"
-herdr pane current --current
-herdr pane list --workspace "$HERDR_WORKSPACE_ID"
-herdr agent list
+hc-tui status
+hc-tui workspace list
+hc-tui tab list
+hc-tui pane list
+hc-tui agent list
 ```
 
-Creation responses expose the IDs to use next. `workspace create` returns `.result.workspace`, `.result.tab`, and `.result.root_pane`. `tab create` returns `.result.tab` and `.result.root_pane`. `pane split` returns the new pane as `.result.pane`.
+Prefer `--current` only when `$HERDR_PANE_ID` is set and the command targets your own calling pane; otherwise pass explicit `--pane <id>`, `--workspace <id>`, or `--cwd "$PWD"` from discovery JSON.
 
-IDs and live agent names are scoped to one server. Two saved SSH machines can both have `w1:p1` or an agent named `reviewer`. Selecting a machine in the TUI does not retarget commands running in your pane: without `--machine`, they still use the inherited session and socket context.
+Creation responses expose the IDs to use next:
+- `workspace create` returns `.result.workspace`, `.result.tab`, and `.result.root_pane`.
+- `tab create` returns `.result.tab` and `.result.root_pane`.
+- `pane split` returns the new pane as `.result.pane`.
 
-To control a saved SSH machine, use the same global prefix for discovery and every later command:
+## Remote machines
+
+In `hc` mode, `hc-tui` automatically syncs saved `hc` machines (spaces, tabs, panes, agent status, and git repository metadata). Use `hc` (`hc machine ls`, `hc exec --on <machine>`) for direct machine/file operations, or use `hc-tui --remote <ssh-target>` to attach the TUI directly over SSH.
+
+Legacy TUI machine commands (`hc-tui machine ...`) apply only to standalone SSH profiles when used:
 
 ```bash
-herdr --machine <label-or-id> agent list
-herdr --machine <label-or-id> pane list
-herdr --machine <label-or-id> agent prompt <remote-agent-name> "Reply with your current status." --wait --timeout 120000
+hc-tui --machine <label-or-id> agent list
+hc-tui --machine <label-or-id> pane list
 ```
 
-The selector must be an enabled saved profile ID or a unique, case-sensitive label, not an arbitrary SSH hostname. Commands use that profile's remote session without an open TUI. Do not combine `--machine` with `--session` or `--remote`. Discover IDs on that machine; inherited local IDs and `--current` do not identify remote panes.
-
-Both installations must support machine API forwarding, and the remote server must already be running and API-compatible. Forwarding never installs, starts, or restarts a server and never falls back to Local. Local configuration, session management, installation commands, and interactive attachment are not forwarded. Remote worktree paths must be absolute, `~`, or start with `~/`; plugin link paths must be absolute. A connection failure does not prove a mutation was not applied: inspect remote state before retrying.
-
-`herdr machine list` lists saved connection profiles, not a cross-machine pane inventory; add `--json` for scripts. Only add, remove, enable, or disable profiles when the user asks. Removing a profile disconnects the client but does not stop remote sessions. Interactive `machine add` discovers running remote sessions and may ask the user to pick one; non-interactive setup uses the remote default session unless `--remote-session` is explicitly supplied. Use `herdr machine status [<label-or-id>] --json` to diagnose a failing machine. `herdr machine reconnect` needs the user to complete SSH authentication in their terminal; do not run it for them. Setup asks before stopping an incompatible server and defaults to No; do not approve replacement without the user's consent. Experimental handoff is not part of `machine add`.
+The selector must be a saved profile ID or unique case-sensitive label, not an arbitrary hostname. Do not combine `--machine` with `--session` or `--remote`.
 
 ## Start and coordinate an agent
 
-Default to a sibling pane in the current tab and the current working directory. Do not create a workspace, tab, worktree, or different cwd unless the user explicitly requests that topology or location.
-
-Honor a direction requested by the user. Otherwise inspect the caller pane:
+Default to a sibling pane in the current tab and working directory unless the user explicitly asks for a new tab or workspace:
 
 ```bash
-herdr pane layout --pane "$HERDR_PANE_ID"
+hc-tui pane split --pane <pane-id> --direction right --cwd "$PWD" --no-focus
 ```
 
-Split a wide pane to the right and a narrow or tall pane down. Avoid repeated same-direction splits that create unusably narrow columns or short rows. Keep the user's focus in the calling pane and explicitly preserve the caller's working directory:
+Pass `--current` when `$HERDR_PANE_ID` is set. Split a wide pane `right` and a narrow/tall pane `down`. Avoid repeated same-direction splits that create unusable columns or rows. Read the new pane ID from `.result.pane.pane_id`.
+
+Start a supported agent only inside an idle shell pane (no active foreground command):
 
 ```bash
-herdr pane split --current --direction right --cwd "$PWD" --no-focus
+hc-tui agent start reviewer --kind codex --pane <returned-pane-id>
 ```
 
-Replace `right` with `down` when appropriate. Read the new pane ID from `.result.pane.pane_id`.
-
-An available shell pane must be at its interactive prompt, with the shell itself in the foreground and no foreground command, editor, or agent running. Start a supported agent in that pane with a useful unique name:
+Pass native agent arguments only after `--`:
 
 ```bash
-herdr agent start reviewer --kind codex --pane <returned-pane-id>
+hc-tui agent start reviewer --kind codex --pane <returned-pane-id> -- <agent-args...>
 ```
 
-Use the kind requested by the user. Run `herdr agent` to inspect the installed kind list and options. Pass native agent arguments only after `--`:
+Submit work and wait for settlement:
 
 ```bash
-herdr agent start reviewer --kind codex --pane <returned-pane-id> -- <agent-args...>
+hc-tui agent prompt reviewer "Review the current diff and report only actionable findings." --wait --timeout 120000
+hc-tui agent wait reviewer --until blocked --timeout 120000
+hc-tui agent send-keys reviewer esc
+hc-tui agent get reviewer
+hc-tui agent read reviewer --source recent-unwrapped --lines 120
 ```
 
-A successful `agent start` returns only after Herdr detects the expected agent in the same pane and considers it ready for interactive input. If the agent is blocked during startup, the command returns `agent_not_ready` immediately but keeps the name available for `agent read` and `agent send-keys`. Wait until the agent becomes idle before prompting it. Startup defaults to a 30-second timeout.
-
-Submit work through the agent surface:
-
-```bash
-herdr agent prompt reviewer "Review the current diff and report only actionable findings." --wait --timeout 120000
-```
-
-`agent prompt` honors the pane's live bracketed-paste mode and sends text followed by encoded Enter as one ordered submission. It reports successful submission only after both have been written; that alone does not prove the agent started a turn. For Codex on Windows, Herdr sends a paste boundary before Enter so submission does not depend on prompt size. It rejects an agent already waiting at an approval or question dialog with `agent_blocked` before sending any input. Inspect the blocked UI and ask the user before answering it. For normal agent work, `--wait` is enough: it waits for the first settled `idle`, `done`, or `blocked` state. Do not repeat those defaults with `--until`.
-
-With `--wait`, a prompt sent from a non-working state must produce observed `working` or `blocked` activity. After submission, Herdr waits up to five seconds for that activity; unrelated `idle`, `done`, or session changes do not satisfy this gate. It returns `agent_prompt_stalled` if no activity is observed, or `timeout` if the caller's timeout expires first. The caller timeout includes submission time. Without a timeout, the settled-state wait is indefinite after activity is observed. This wait tracks lifecycle state, not an individual turn; if the agent is already working, completion of the active turn may satisfy it.
-
-Use `--until` only for a state-specific workflow, such as waiting for an already-running agent to request input:
-
-```bash
-herdr agent wait reviewer --until blocked --timeout 120000
-```
-
-Without `--until`, standalone `agent wait` uses the same settled-state defaults as `agent prompt --wait`.
-
-Use logical keys for interactive agent UI controls:
-
-```bash
-herdr agent send-keys reviewer esc
-herdr agent send-keys reviewer ctrl+c
-```
-
-Herdr validates all keys before writing any bytes. Read the result through the resolved agent:
-
-```bash
-herdr agent get reviewer
-herdr agent read reviewer --source recent-unwrapped --lines 120
-```
-
-If a wait fails or returns `blocked`, inspect `agent get` and `agent read` before deciding what input to send. A timeout or stalled response does not prove the prompt was never delivered; do not blindly submit it again. Use the pane surface only when raw terminal control is intentional.
+`idle` and `done` mark the end of a turn; if `wait` returns `blocked`, inspect `agent get` and `agent read` before sending input.
 
 ## Run an ordinary command in another pane
 
-Create a sibling pane with the same geometry rule, preserve the caller's working directory, and keep user focus unchanged:
-
 ```bash
-herdr pane split --current --direction right --cwd "$PWD" --no-focus
+hc-tui pane split --pane <pane-id> --direction right --cwd "$PWD" --no-focus
+hc-tui pane run <returned-pane-id> "cargo test"
+hc-tui pane wait-output <returned-pane-id> --match "test result" --timeout 120000
+hc-tui pane read <returned-pane-id> --source recent-unwrapped --lines 120
 ```
 
-Read the new pane ID from `.result.pane.pane_id`, then run and inspect the command:
+Read sources (`--source`):
+- `visible`: currently rendered viewport.
+- `recent`: recent rendered output including soft wraps.
+- `recent-unwrapped`: recent output with soft wraps joined (best for logs/transcripts).
+- `detection`: plain-text bottom-buffer snapshot used for agent detection.
 
-```bash
-herdr pane run <returned-pane-id> "just test"
-herdr pane wait-output <returned-pane-id> --match "test result" --timeout 120000
-herdr pane read <returned-pane-id> --source recent-unwrapped --lines 120
-```
-
-`pane run` queues command text and Enter together; success acknowledges admission, not command execution. On macOS, `pane run` and `agent start` reject a command that exceeds the terminal's current canonical line-input limit before queuing it. Wait for the interactive shell prompt before retrying. The check covers this submission, not an earlier incomplete line or a later terminal-mode change. `pane wait-output` searches the selected snapshot immediately, so output that already exists can match. Use `--match <text>` for a literal substring or `--regex <pattern>` for a Rust regular expression. Omitting `--timeout` allows an indefinite wait.
-
-Use the read source that matches the task:
-
-- `visible`: the currently rendered viewport.
-- `recent`: recent rendered output, including soft wraps.
-- `recent-unwrapped`: recent output with soft wraps joined; prefer it for logs and transcripts.
-- `detection`: the plain-text bottom-buffer snapshot used for agent detection.
-
-Use `--format ansi` when colors and terminal styling are evidence. Otherwise use text.
-
-`--lines` asks Herdr for more rows from the pane's available screen and host scrollback. Alternate-screen rows do not enter ordinary host scrollback. For supported idle agents, Herdr can collect application-owned history and restore the viewport afterward, but not every application or response can be recovered this way.
-
-If a larger recent read still does not reveal the completed response, ask the agent to write it as Markdown in a temporary directory and reply only with the file path, then read that file on the same machine. Use this only as a fallback; do not request file output in the initial prompt.
+Use `--format ansi` when terminal styling or colors are evidence.
 
 ## Safety and coordination rules
 
-- Use `--no-focus` for background work unless the user asked to switch context.
-- Use `--current`, an explicit pane ID, or a unique agent name. Do not rely on another client's focused pane.
-- Parse IDs from JSON responses. Do not derive them from sidebar order or examples.
-- Do not close workspaces, tabs, panes, or sessions you did not create unless the user explicitly asked. Ordinary CLI/API closes do not inherit the TUI's last-pane confirmation. `workspace close --group` closes the primary workspace and its linked worktree workspaces; never add it merely to bypass `workspace_group_close_required`.
-- Use `--trust-repository` only after the user has verified the repository. It grants per-request Git trust; it is not a routine retry for a failed worktree command.
-- Client and server versions can differ after an update. Check `herdr status` before relying on new server features. A missing method is not permission to stop or upgrade a server.
-- Never run `herdr server stop` from an active session unless the user explicitly intends to stop the server and its pane processes.
-- Never kill the main Herdr process. Use named test sessions for experiments that need an isolated server.
-- CLI server errors are JSON on stderr with exit status 1. CLI syntax errors exit with status 2.
+- Use `--no-focus` for background work unless the user asked to switch focus.
+- Never guess IDs from sidebar order; read them from JSON responses (`hc-tui workspace list`, `hc-tui pane list`, `hc-tui agent list`, or `hc ls --json`).
+- Do not close workspaces, tabs, panes, or `hc` terminals you did not create unless explicitly requested.
+- Use `--trust-repository` only after the user has verified a repository for linked worktree creation.
+- Never run `hc-tui server stop` from inside an active session unless the user explicitly intends to stop that TUI server.
+- Never stop the host `hc` daemon (`hc server stop`) unless explicitly asked, as it owns live background terminals.
+- CLI server errors are JSON on stderr with exit status 1; syntax errors exit with status 2.

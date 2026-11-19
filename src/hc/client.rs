@@ -199,6 +199,8 @@ impl EventLines {
             "keep" => set(&["keep"]),
             "size" => set(&["cols", "rows"]),
             "foreground" => t["foreground"] = data.clone(),
+            "repository" => t["repository"] = data.clone(),
+            "cwd" => set(&["cwd"]),
             _ => return false,
         }
         true
@@ -816,7 +818,7 @@ impl Core {
     ) -> io::Result<String> {
         let mut params = json!({
             "argv": argv,
-            "timeout": timeout_ms,
+            "timeout": exec_machine_timeout_secs(timeout_ms),
         });
         if let Some(m) = machine {
             params["on"] = json!(m);
@@ -1006,6 +1008,10 @@ pub struct HcMachineInfo {
     pub target: Option<String>,
     pub host: Option<String>,
     pub connected: bool,
+}
+
+fn exec_machine_timeout_secs(timeout_ms: u64) -> f64 {
+    (timeout_ms as f64 / 1000.0).clamp(0.1, 600.0)
 }
 
 #[derive(Default)]
@@ -1416,6 +1422,16 @@ mod tests {
         assert!(p1.terminals || p2.terminals);
         assert_eq!(lines.live()["terminals"][0]["title"], "hi");
         assert_eq!(lines.live()["terminals"].as_array().unwrap().len(), 2);
+
+        let repo_event = event(
+            8,
+            "repository",
+            "t1",
+            json!({"state": "ready", "branch": "main", "ahead_behind": [1, 0]}),
+        );
+        let p3 = lines.push(repo_event.as_bytes());
+        assert!(p3.terminals);
+        assert_eq!(lines.live()["terminals"][0]["repository"]["branch"], "main");
     }
 
     #[test]
@@ -1441,5 +1457,12 @@ mod tests {
             args.last().map(String::as_str),
             Some("hc connect --session 'work'\"'\"'1'")
         );
+    }
+
+    #[test]
+    fn exec_machine_timeout_converts_ms_to_bounded_seconds() {
+        assert!((exec_machine_timeout_secs(5_000) - 5.0).abs() < f64::EPSILON);
+        assert!((exec_machine_timeout_secs(0) - 0.1).abs() < f64::EPSILON);
+        assert!((exec_machine_timeout_secs(900_000) - 600.0).abs() < f64::EPSILON);
     }
 }

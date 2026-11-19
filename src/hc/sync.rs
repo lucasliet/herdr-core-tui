@@ -238,26 +238,56 @@ fn terminal_label_str<'a>(info: &'a Value, key: &str) -> Option<&'a str> {
         .filter(|val| !val.is_empty())
 }
 
+pub(crate) fn status_agent_label(info: &Value) -> Option<String> {
+    let raw = info
+        .pointer("/status/app")
+        .and_then(Value::as_str)
+        .or_else(|| info.pointer("/status/label").and_then(Value::as_str))
+        .or_else(|| info.pointer("/foreground/name").and_then(Value::as_str))
+        .or_else(|| info.pointer("/foreground/program").and_then(Value::as_str))
+        .or_else(|| terminal_label_str(info, "herdr.agent"))
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    Some(
+        crate::detect::parse_agent_label(raw)
+            .map(|agent| crate::detect::agent_label(agent).to_owned())
+            .unwrap_or_else(|| raw.to_owned()),
+    )
+}
+
+pub(crate) fn foreground_detected_agent(info: &Value) -> Option<crate::detect::Agent> {
+    let candidates = [
+        info.pointer("/foreground/name").and_then(Value::as_str),
+        info.pointer("/foreground/argv/0").and_then(Value::as_str),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .find_map(crate::detect::identify_agent)
+}
+
 pub(crate) fn map_hc_status(info: &Value) -> Option<(AgentState, String, Option<String>)> {
-    let state_str = info.pointer("/status/state").and_then(Value::as_str)?;
+    let Some(state_str) = info.pointer("/status/state").and_then(Value::as_str) else {
+        let agent = foreground_detected_agent(info)?;
+        return Some((
+            AgentState::Idle,
+            crate::detect::agent_label(agent).to_owned(),
+            None,
+        ));
+    };
     let state = match state_str {
         "working" => AgentState::Working,
         "blocked" => AgentState::Blocked,
         "done" | "idle" => AgentState::Idle,
         _ => return None,
     };
-    let agent_label = info
-        .pointer("/status/label")
-        .and_then(Value::as_str)
-        .or_else(|| info.pointer("/foreground/program").and_then(Value::as_str))
-        .or_else(|| terminal_label_str(info, "herdr.agent"))
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("agent")
-        .to_owned();
+    let agent_label = status_agent_label(info).unwrap_or_else(|| "agent".to_owned());
     let message = info
-        .pointer("/status/message")
+        .pointer("/status/msg")
         .and_then(Value::as_str)
+        .or_else(|| info.pointer("/status/message").and_then(Value::as_str))
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .map(str::to_owned);
@@ -274,11 +304,18 @@ fn apply_hc_metadata_mutation(
         terminal.cwd = cwd;
         non_agent_changed = true;
     }
-    if let Some(title) = terminal_title(info) {
-        if terminal.terminal_title.as_deref() != Some(title.as_str()) {
-            terminal.set_terminal_title(Some(title));
+    match terminal_title(info) {
+        Some(title) => {
+            if terminal.terminal_title.as_deref() != Some(title.as_str()) {
+                terminal.set_terminal_title(Some(title));
+                non_agent_changed = true;
+            }
+        }
+        None if terminal.terminal_title.is_some() => {
+            terminal.set_terminal_title(None);
             non_agent_changed = true;
         }
+        None => {}
     }
     let mutation = if let Some((state, agent_label, message)) = map_hc_status(info) {
         let already_same = terminal.hook_authority.as_ref().is_some_and(|auth| {
@@ -1496,7 +1533,7 @@ pub fn apply_hc_metadata_to_state(
         if let Some((branch, ahead_behind)) = c3_repository_facts(info) {
             for ws in &mut state.workspaces {
                 if ws.find_tab_index_for_pane(pane_id).is_some()
-                    && ws.focused_pane_id() == Some(pane_id)
+                    && (ws.focused_pane_id() == Some(pane_id) || ws.cached_git_branch.is_none())
                 {
                     if branch.is_some() && ws.cached_git_branch != branch {
                         ws.cached_git_branch = branch;
@@ -1504,6 +1541,20 @@ pub fn apply_hc_metadata_to_state(
                     }
                     if ws.cached_git_ahead_behind != ahead_behind {
                         ws.cached_git_ahead_behind = ahead_behind;
+                        dirty = true;
+                    }
+                    break;
+                }
+            }
+        } else if info.pointer("/repository/state").and_then(Value::as_str) == Some("none") {
+            for ws in &mut state.workspaces {
+                if get_workspace_machine(&ws.id).is_some()
+                    && ws.find_tab_index_for_pane(pane_id).is_some()
+                    && ws.focused_pane_id() == Some(pane_id)
+                {
+                    if ws.cached_git_branch.is_some() || ws.cached_git_ahead_behind.is_some() {
+                        ws.cached_git_branch = None;
+                        ws.cached_git_ahead_behind = None;
                         dirty = true;
                     }
                     break;
@@ -2000,6 +2051,9 @@ pub fn handle_hc_sync(
         if !is_address_known(addr) && adopt_unmapped_hc_terminal(app, info) {
             dirty = true;
         }
+        if sync_hc_terminal_runtime_cwd(app, addr, info) {
+            dirty = true;
+        }
     }
 
     app.state.session_dirty = was_dirty;
@@ -2011,6 +2065,27 @@ pub fn handle_hc_sync(
     }
 
     updates
+}
+
+fn sync_hc_terminal_runtime_cwd(app: &App, addr: &str, info: &Value) -> bool {
+    let cwd = terminal_cwd(info);
+    if !cwd.is_absolute() {
+        return false;
+    }
+    let Some(pane_id) = pane_for_address(addr) else {
+        return false;
+    };
+    let Some((_, pane)) = app.find_pane(pane_id) else {
+        return false;
+    };
+    let Some(runtime) = app.terminal_runtimes.get(&pane.attached_terminal_id) else {
+        return false;
+    };
+    if runtime.cwd().as_ref() == Some(&cwd) {
+        return false;
+    }
+    runtime.set_reported_cwd(Some(cwd));
+    true
 }
 
 #[cfg(test)]
@@ -2094,6 +2169,78 @@ mod tests {
         let plain = json!({ "address": "t1" });
         let _ = apply_hc_metadata_mutation(&mut terminal, &plain);
         assert_eq!(terminal.state, AgentState::Unknown);
+    }
+
+    #[test]
+    fn hc_status_maps_hc_app_msg_and_foreground_name() {
+        let claude = json!({
+            "address": "t8",
+            "foreground": { "name": "claude" },
+            "status": { "app": "claude-code", "state": "idle" }
+        });
+        assert_eq!(
+            map_hc_status(&claude),
+            Some((AgentState::Idle, "claude".to_owned(), None))
+        );
+
+        let antigravity = json!({
+            "address": "macbook-pro/t9",
+            "foreground": { "name": "agy" },
+            "status": {
+                "app": "antigravity",
+                "msg": "Herdr And Herder-App Session Synchronization",
+                "state": "working"
+            }
+        });
+        assert_eq!(
+            map_hc_status(&antigravity),
+            Some((
+                AgentState::Working,
+                "agy".to_owned(),
+                Some("Herdr And Herder-App Session Synchronization".to_owned()),
+            ))
+        );
+
+        let foreground_only = json!({
+            "address": "t10",
+            "foreground": { "name": "agy" },
+            "status": { "state": "working" }
+        });
+        assert_eq!(
+            map_hc_status(&foreground_only),
+            Some((AgentState::Working, "agy".to_owned(), None))
+        );
+    }
+
+    #[test]
+    fn hc_foreground_fallback_detects_agent_and_clears_removed_title() {
+        let codex_without_status = json!({
+            "address": "t11",
+            "foreground": { "name": "codex" },
+            "status": null
+        });
+        assert_eq!(
+            map_hc_status(&codex_without_status),
+            Some((AgentState::Idle, "codex".to_owned(), None))
+        );
+
+        let plain_shell = json!({
+            "address": "t12",
+            "foreground": { "name": "zsh" },
+            "status": null
+        });
+        assert_eq!(map_hc_status(&plain_shell), None);
+
+        let mut terminal = TerminalState::new(TerminalId::alloc(), PathBuf::from("/tmp"));
+        let with_title = json!({ "address": "t11", "title": "Codex" });
+        let (_, changed) = apply_hc_metadata_mutation(&mut terminal, &with_title);
+        assert!(changed);
+        assert_eq!(terminal.terminal_title.as_deref(), Some("Codex"));
+
+        let without_title = json!({ "address": "t11" });
+        let (_, changed) = apply_hc_metadata_mutation(&mut terminal, &without_title);
+        assert!(changed);
+        assert_eq!(terminal.terminal_title, None);
     }
 
     #[test]
@@ -2406,6 +2553,20 @@ mod tests {
             app.pane_metadata(0, pane_id).unwrap().agent_status,
             crate::api::schema::AgentStatus::Done
         );
+
+        let remote_ws_id = app.state.workspaces[0].id.clone();
+        set_workspace_machine(&remote_ws_id, Some("oracle".into()));
+        let cleared_repo_info = json!({
+            "address": "oracle/t1",
+            "state": "live",
+            "repository": { "state": "none" }
+        });
+        let (_updates, repo_cleared_dirty) =
+            apply_hc_metadata_to_state(&mut app.state, &[cleared_repo_info]);
+        assert!(repo_cleared_dirty);
+        assert_eq!(app.state.workspaces[0].cached_git_branch, None);
+        assert_eq!(app.state.workspaces[0].cached_git_ahead_behind, None);
+
         super::super::client::reset_registry();
     }
 
@@ -2458,6 +2619,58 @@ mod tests {
         assert_eq!(
             find_workspace_for_doc_space(&app, &remote_space, Some("oracle")),
             Some(1)
+        );
+        super::super::client::reset_registry();
+    }
+
+    #[tokio::test]
+    async fn hc_sync_updates_runtime_reported_cwd_for_remote_pane() {
+        let _guard = registry_test_guard();
+        super::super::client::reset_registry();
+        let (_api_tx, api_rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut app = App::new(
+            &crate::config::Config::default(),
+            crate::app::AppPolicy::TEST,
+            None,
+            api_rx,
+            crate::api::EventHub::default(),
+        );
+        let ws = Workspace::test_new("oracle");
+        let pane_id = ws.tabs[0].layout.pane_ids()[0];
+        let term_id = ws
+            .pane_state(pane_id)
+            .expect("pane state")
+            .attached_terminal_id
+            .clone();
+        set_workspace_machine(&ws.id, Some("oracle".into()));
+        app.state.workspaces.push(ws);
+        register_pane_address(pane_id, "oracle/t-remote-cwd".to_owned());
+
+        let (runtime, _rx) = crate::terminal::TerminalRuntime::test_with_channel(80, 24);
+        app.terminal_runtimes.insert(term_id, runtime);
+
+        let sync_info = json!({
+            "address": "oracle/t-remote-cwd",
+            "cwd": "/home/ubuntu/shell",
+            "foreground": {
+                "name": "claude",
+                "cwd": "/home/ubuntu/app"
+            }
+        });
+        handle_hc_sync(&mut app, false, vec![sync_info], None, None);
+
+        assert_eq!(
+            app.state.workspaces[0].tabs[0].cwd_for_pane(
+                pane_id,
+                &app.state.terminals,
+                &app.terminal_runtimes
+            ),
+            Some(PathBuf::from("/home/ubuntu/app"))
+        );
+        assert_eq!(
+            app.state.workspaces[0].tabs[0]
+                .foreground_cwd_for_pane(pane_id, &app.terminal_runtimes),
+            Some(PathBuf::from("/home/ubuntu/app"))
         );
         super::super::client::reset_registry();
     }

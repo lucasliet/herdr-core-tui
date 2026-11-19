@@ -512,6 +512,11 @@ fn finish_cli(outcome: io::Result<cli::CommandOutcome>) -> io::Result<()> {
     }
 }
 
+fn is_fork_upgrade_invocation(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--upgrade")
+        || matches!(args.get(1).map(String::as_str), Some("update" | "upgrade"))
+}
+
 fn main() -> io::Result<()> {
     let raw_args: Vec<String> = match args_as_utf8(std::env::args_os()) {
         Ok(args) => args,
@@ -593,6 +598,7 @@ fn main() -> io::Result<()> {
         println!("       herdr-core-tui completion zsh");
         println!("       herdr-core-tui --upgrade");
         println!("       herdr-core-tui update");
+        println!("       herdr-core-tui upgrade");
         println!("       herdr-core-tui channel set <stable|preview>");
         println!("       herdr-core-tui machine <subcommand> ...");
         println!("       herdr-core-tui server stop");
@@ -736,7 +742,7 @@ fn main() -> io::Result<()> {
         return Ok(());
     }
 
-    if args.iter().any(|a| a == "--upgrade") || args.get(1).map(|s| s.as_str()) == Some("update") {
+    if is_fork_upgrade_invocation(&args) {
         if let Err(err) = update::run_fork_upgrade() {
             eprintln!("error: {err}");
             std::process::exit(1);
@@ -771,6 +777,7 @@ fn main() -> io::Result<()> {
                 "client",
                 "remote-client-bridge",
                 "update",
+                "upgrade",
                 "status",
                 "config",
                 "channel",
@@ -898,5 +905,15 @@ mod tests {
             args_as_utf8(args).unwrap_err(),
             "argument 2 is not valid UTF-8"
         );
+    }
+
+    #[test]
+    fn fork_upgrade_invocation_accepts_flag_update_and_upgrade() {
+        let args = |items: &[&str]| items.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>();
+        assert!(is_fork_upgrade_invocation(&args(&["hc-tui", "--upgrade"])));
+        assert!(is_fork_upgrade_invocation(&args(&["hc-tui", "update"])));
+        assert!(is_fork_upgrade_invocation(&args(&["hc-tui", "upgrade"])));
+        assert!(!is_fork_upgrade_invocation(&args(&["hc-tui", "status"])));
+        assert!(!is_fork_upgrade_invocation(&args(&["hc-tui"])));
     }
 }

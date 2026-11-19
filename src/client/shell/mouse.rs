@@ -35,6 +35,19 @@ impl ClientShellState {
         }
     }
 
+    fn set_right_panel_width_from_column(&mut self, column: u16, outcome: &mut ClientShellInput) {
+        let cols = self.last_composed_size.map(|(cols, _)| cols).unwrap_or(120);
+        let new_width = cols.saturating_sub(column).clamp(
+            super::right_panel::MIN_RIGHT_PANEL_WIDTH,
+            super::right_panel::MAX_RIGHT_PANEL_WIDTH,
+        );
+        if self.right_panel.width != new_width {
+            self.right_panel.width = new_width;
+            outcome.repaint = true;
+            outcome.resize = true;
+        }
+    }
+
     fn pane_scrollbar_offset(
         hit: &PaneHit,
         row: u16,
@@ -1030,6 +1043,10 @@ impl ClientShellState {
                     self.set_sidebar_section_from_row(mouse.row, outcome);
                     return;
                 }
+                Some(ClientChromeDrag::RightPanelWidth) => {
+                    self.set_right_panel_width_from_column(mouse.column, outcome);
+                    return;
+                }
                 Some(ClientChromeDrag::WorkspaceScrollbar { grab_row_offset }) => {
                     if let Some(metrics) = self.hits.workspace_scroll_metrics {
                         let offset = crate::ui::scrollbar_offset_from_drag_row(
@@ -1360,7 +1377,8 @@ impl ClientShellState {
                     ClientChromeDrag::SidebarWidth | ClientChromeDrag::SidebarSection => {
                         self.persist_chrome_preferences(outcome);
                     }
-                    ClientChromeDrag::WorkspaceScrollbar { .. }
+                    ClientChromeDrag::RightPanelWidth
+                    | ClientChromeDrag::WorkspaceScrollbar { .. }
                     | ClientChromeDrag::AgentScrollbar { .. }
                     | ClientChromeDrag::HelpScrollbar { .. }
                     | ClientChromeDrag::NavigatorScrollbar { .. }
@@ -1929,6 +1947,24 @@ impl ClientShellState {
                     outcome.repaint = true;
                 }
             }
+            MouseEventKind::ScrollUp if super::contains(self.hits.right_panel_body, point) => {
+                let next = self.right_panel.scroll.saturating_sub(1);
+                if next != self.right_panel.scroll {
+                    self.right_panel.scroll = next;
+                    outcome.repaint = true;
+                }
+            }
+            MouseEventKind::ScrollDown if super::contains(self.hits.right_panel_body, point) => {
+                let next = self
+                    .right_panel
+                    .scroll
+                    .saturating_add(1)
+                    .min(self.hits.right_panel_max_scroll);
+                if next != self.right_panel.scroll {
+                    self.right_panel.scroll = next;
+                    outcome.repaint = true;
+                }
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if self.selection.take().is_some() {
                     outcome.repaint = true;
@@ -2063,6 +2099,63 @@ impl ClientShellState {
                         crate::input::KeybindMatch::Action(crate::input::KeybindAction::NewTab),
                         outcome,
                     );
+                    return;
+                }
+                if super::contains(self.hits.tab_bar_files_button, point) {
+                    self.right_panel
+                        .toggle_tab(super::right_panel::RightPanelTab::Files);
+                    if let Some(snapshot) = self.snapshot.as_deref() {
+                        self.right_panel.sync_target(snapshot);
+                    }
+                    outcome.repaint = true;
+                    outcome.resize = true;
+                    return;
+                }
+                if super::contains(self.hits.tab_bar_changes_button, point) {
+                    self.right_panel
+                        .toggle_tab(super::right_panel::RightPanelTab::Changes);
+                    if let Some(snapshot) = self.snapshot.as_deref() {
+                        self.right_panel.sync_target(snapshot);
+                    }
+                    outcome.repaint = true;
+                    outcome.resize = true;
+                    return;
+                }
+                if super::contains(self.hits.right_panel_close, point) {
+                    self.right_panel.close();
+                    outcome.repaint = true;
+                    outcome.resize = true;
+                    return;
+                }
+                if super::contains(self.hits.right_panel_refresh, point) {
+                    self.right_panel.refresh();
+                    outcome.repaint = true;
+                    return;
+                }
+                if super::contains(self.hits.right_panel_divider, point) {
+                    self.chrome_drag = Some(ClientChromeDrag::RightPanelWidth);
+                    outcome.repaint = true;
+                    return;
+                }
+                let clicked_right_panel_row = self
+                    .hits
+                    .right_panel_rows
+                    .iter()
+                    .find(|(rect, _)| super::contains(*rect, point))
+                    .map(|(_, hit)| hit.clone());
+                if let Some(hit) = clicked_right_panel_row {
+                    match hit {
+                        super::right_panel::RightPanelRowHit::ToggleDir(path) => {
+                            self.right_panel.toggle_dir(&path);
+                        }
+                        super::right_panel::RightPanelRowHit::ToggleDiffFile(path) => {
+                            self.right_panel.toggle_diff_file(&path);
+                        }
+                        super::right_panel::RightPanelRowHit::SelectFile(path) => {
+                            self.right_panel.selected_path = Some(path);
+                        }
+                    }
+                    outcome.repaint = true;
                     return;
                 }
                 if super::contains(self.hits.tab_scroll_left, point) {

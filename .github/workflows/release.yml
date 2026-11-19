@@ -89,6 +89,10 @@ jobs:
             echo "error: tag $RELEASE_TAG (base $TAG_BASE) doesn't match Cargo.toml version $CARGO_VERSION"
             exit 1
           fi
+          if [[ "$RELEASE_TAG" =~ -core-tui\.([0-9]+)$ ]]; then
+            echo "HERDR_BUILD_CHANNEL=core-tui" >> "$GITHUB_ENV"
+            echo "HERDR_BUILD_ID=${BASH_REMATCH[1]}" >> "$GITHUB_ENV"
+          fi
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # v1

@@ -1,6 +1,9 @@
 use super::*;
 
 const TAB_SCROLL_BUTTON_WIDTH: u16 = 3;
+const FILES_BUTTON_TEXT: &str = " Files ";
+const CHANGES_BUTTON_TEXT: &str = " Changes ";
+const RIGHT_PANEL_BUTTONS_WIDTH: u16 = 17;
 const MIN_TAB_STRIP_WIDTH: u16 =
     MIN_TAB_WIDTH + NEW_TAB_WIDTH + TAB_SCROLL_BUTTON_WIDTH.saturating_mul(2);
 
@@ -12,6 +15,7 @@ pub(crate) fn render_tab_bar(
     tab_scroll: &mut usize,
     reveal_focused_tab: &mut bool,
     tab_drag_insert_index: Option<usize>,
+    right_panel_active_tab: Option<super::right_panel::RightPanelTab>,
     hits: &mut ShellHitMap,
 ) {
     let palette = &config.palette;
@@ -28,8 +32,22 @@ pub(crate) fn render_tab_bar(
             display_width(&label).saturating_add(4).max(MIN_TAB_WIDTH)
         })
         .collect::<Vec<_>>();
-    let content = tab_bar_content_area(snapshot, area);
+    let status_area = tab_bar_status_area(snapshot, area);
+    let base_content = tab_bar_content_area(snapshot, area);
     let mouse_chrome = config.mouse_capture;
+    let content = if right_panel_active_tab.is_some()
+        && mouse_chrome
+        && base_content.width > MIN_TAB_STRIP_WIDTH + RIGHT_PANEL_BUTTONS_WIDTH
+    {
+        Rect {
+            width: base_content
+                .width
+                .saturating_sub(RIGHT_PANEL_BUTTONS_WIDTH + 1),
+            ..base_content
+        }
+    } else {
+        base_content
+    };
     let new_tab_width = if mouse_chrome { NEW_TAB_WIDTH } else { 0 };
     let desired_total = desired_widths
         .iter()
@@ -219,6 +237,55 @@ pub(crate) fn render_tab_bar(
                 Style::default().fg(palette.accent),
             );
         }
+    }
+    let buttons_right = status_area
+        .map(|status| status.x.saturating_sub(1))
+        .unwrap_or(area.right());
+    if mouse_chrome
+        && buttons_right.saturating_sub(hits.new_tab.right()) > RIGHT_PANEL_BUTTONS_WIDTH
+    {
+        let changes_width = display_width(CHANGES_BUTTON_TEXT);
+        let files_width = display_width(FILES_BUTTON_TEXT);
+        let changes_rect = Rect::new(
+            buttons_right.saturating_sub(changes_width),
+            area.y,
+            changes_width,
+            1,
+        );
+        let files_rect = Rect::new(
+            changes_rect.x.saturating_sub(files_width + 1),
+            area.y,
+            files_width,
+            1,
+        );
+        let button_style = |tab: super::right_panel::RightPanelTab| {
+            if right_panel_active_tab == Some(tab) {
+                Style::default()
+                    .fg(panel_contrast_fg(palette))
+                    .bg(palette.accent)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(palette.overlay1).bg(palette.surface0)
+            }
+        };
+        put_text(
+            buffer,
+            files_rect.x,
+            files_rect.y,
+            files_rect.width,
+            FILES_BUTTON_TEXT,
+            button_style(super::right_panel::RightPanelTab::Files),
+        );
+        put_text(
+            buffer,
+            changes_rect.x,
+            changes_rect.y,
+            changes_rect.width,
+            CHANGES_BUTTON_TEXT,
+            button_style(super::right_panel::RightPanelTab::Changes),
+        );
+        hits.tab_bar_files_button = files_rect;
+        hits.tab_bar_changes_button = changes_rect;
     }
     render_tab_bar_status(buffer, area, snapshot, palette);
 }

@@ -79,6 +79,7 @@ impl ClientShellState {
             reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
             dragged_workspace_id: None,
             workspace_drop_indicator_row: None,
+            right_panel: &self.right_panel,
         };
         if let Some(snapshot) = local_snapshot {
             render::render_sidebar(
@@ -187,6 +188,7 @@ impl ClientShellState {
         if snapshot.revision != surface.projection_revision {
             return None;
         }
+        self.right_panel.sync_target(snapshot);
         let layout = self.layout(cols, rows);
         if self.last_tab_bar_width != Some(layout.tab_bar.width) {
             self.last_tab_bar_width = Some(layout.tab_bar.width);
@@ -237,6 +239,7 @@ impl ClientShellState {
                 reveal_navigation_workspace: &mut self.reveal_navigation_workspace,
                 dragged_workspace_id,
                 workspace_drop_indicator_row,
+                right_panel: &self.right_panel,
             },
         );
         self.hits.panes = surface
@@ -341,6 +344,8 @@ impl ClientShellState {
             self.hits.new_tab = Rect::default();
             self.hits.tab_scroll_left = Rect::default();
             self.hits.tab_scroll_right = Rect::default();
+            self.hits.tab_bar_files_button = Rect::default();
+            self.hits.tab_bar_changes_button = Rect::default();
         }
         let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
         let mode_bar_cells = mode_bar.map(|bar| {

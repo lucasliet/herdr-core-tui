@@ -29,6 +29,7 @@ mod notifications;
 mod overlay_input;
 mod preferences;
 mod render;
+pub(super) mod right_panel;
 mod scroll;
 mod settings;
 mod state;

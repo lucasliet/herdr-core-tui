@@ -594,6 +594,11 @@ impl TerminalRuntime {
         self.0.foreground_cwd()
     }
 
+    /// Update the reported working directory for an externally managed terminal runtime.
+    pub fn set_reported_cwd(&self, cwd: Option<std::path::PathBuf>) {
+        self.0.set_reported_cwd(cwd);
+    }
+
     pub fn child_pid(&self) -> Option<u32> {
         self.0.child_pid()
     }

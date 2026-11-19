@@ -392,6 +392,18 @@ impl ClientShellConfig {
         tab_count: usize,
         sidebar_width: u16,
     ) -> ClientShellLayout {
+        self.layout_with_right_panel(cols, rows, sidebar_collapsed, tab_count, sidebar_width, 0)
+    }
+
+    pub(super) fn layout_with_right_panel(
+        &self,
+        cols: u16,
+        rows: u16,
+        sidebar_collapsed: bool,
+        tab_count: usize,
+        sidebar_width: u16,
+        right_panel_width: u16,
+    ) -> ClientShellLayout {
         if cols <= self.mobile_width_threshold {
             let header_height = rows.min(2);
             return ClientShellLayout {
@@ -399,6 +411,7 @@ impl ClientShellConfig {
                 tab_bar: Rect::default(),
                 mobile_header: Rect::new(0, 0, cols, header_height),
                 pane_surface: Rect::new(0, header_height, cols, rows.saturating_sub(header_height)),
+                right_panel: Rect::default(),
             };
         }
 
@@ -419,7 +432,7 @@ impl ClientShellConfig {
         let main = Rect::new(sidebar_width, 0, cols.saturating_sub(sidebar_width), rows);
         let show_tab_bar = rows > 1 && !(self.hide_tab_bar_when_single_tab && tab_count == 1);
         let tab_height = u16::from(show_tab_bar);
-        let (tab_bar, pane_surface) = match self.tab_bar_position {
+        let (tab_bar, mut pane_surface) = match self.tab_bar_position {
             TabBarPositionConfig::Top => (
                 Rect::new(main.x, 0, main.width, tab_height),
                 Rect::new(
@@ -439,12 +452,32 @@ impl ClientShellConfig {
                 Rect::new(main.x, 0, main.width, rows.saturating_sub(tab_height)),
             ),
         };
+        let mut right_panel = Rect::default();
+        if right_panel_width > 0 && pane_surface.width > 24 && pane_surface.height > 0 {
+            let rp_width = right_panel_width
+                .clamp(
+                    super::right_panel::MIN_RIGHT_PANEL_WIDTH,
+                    super::right_panel::MAX_RIGHT_PANEL_WIDTH,
+                )
+                .min(pane_surface.width.saturating_sub(20));
+            if rp_width >= 16 {
+                let pane_width = pane_surface.width.saturating_sub(rp_width);
+                right_panel = Rect::new(
+                    pane_surface.x.saturating_add(pane_width),
+                    pane_surface.y,
+                    rp_width,
+                    pane_surface.height,
+                );
+                pane_surface.width = pane_width;
+            }
+        }
 
         ClientShellLayout {
             sidebar: Rect::new(0, 0, sidebar_width, rows),
             tab_bar,
             mobile_header: Rect::default(),
             pane_surface,
+            right_panel,
         }
     }
 

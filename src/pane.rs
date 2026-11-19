@@ -4212,6 +4212,13 @@ impl PaneRuntime {
         crate::platform::pane_process_cwd(pid)
     }
 
+    /// Update the reported working directory for panes managed externally (such as `hc` panes).
+    pub fn set_reported_cwd(&self, cwd: Option<std::path::PathBuf>) {
+        if let Ok(mut reported_cwd) = self.reported_cwd.lock() {
+            *reported_cwd = cwd.filter(|path| path.is_absolute());
+        }
+    }
+
     pub fn cwd_for_persistence(&self) -> Option<std::path::PathBuf> {
         let pid = self.child_pid.load(Ordering::Acquire);
         let exited = self.cwd_process_exited.load(Ordering::Acquire);
@@ -4259,6 +4266,9 @@ impl PaneRuntime {
         #[cfg(unix)]
         {
             let pid = self.child_pid.load(Ordering::Acquire);
+            if pid == 0 {
+                return self.cwd();
+            }
             let shell_cwd = absolute_process_cwd(pid);
             let foreground_pgid = self
                 .io
@@ -4276,7 +4286,7 @@ impl PaneRuntime {
 
         #[cfg(not(unix))]
         {
-            None
+            self.cwd()
         }
     }
 }
@@ -4941,6 +4951,20 @@ mod tests {
         *runtime.reported_cwd.lock().unwrap() = Some(cwd.clone());
 
         assert_eq!(runtime.follow_cwd(), Some(cwd));
+    }
+
+    #[tokio::test]
+    async fn set_reported_cwd_updates_cwd_and_foreground_cwd_when_child_pid_is_zero() {
+        let (runtime, _rx) = PaneRuntime::test_with_channel(80, 24);
+        let remote_cwd = std::path::PathBuf::from("/remote/hc/project");
+        runtime.set_reported_cwd(Some(remote_cwd.clone()));
+
+        assert_eq!(runtime.cwd(), Some(remote_cwd.clone()));
+        assert_eq!(runtime.foreground_cwd(), Some(remote_cwd));
+
+        runtime.set_reported_cwd(Some(std::path::PathBuf::from("relative/path")));
+        assert_eq!(runtime.cwd(), None);
+        assert_eq!(runtime.foreground_cwd(), None);
     }
 
     #[test]

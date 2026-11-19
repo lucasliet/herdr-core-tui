@@ -59,6 +59,7 @@ pub(super) struct ClientShellLayout {
     pub tab_bar: Rect,
     pub mobile_header: Rect,
     pub pane_surface: Rect,
+    pub right_panel: Rect,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -147,6 +148,14 @@ pub(super) struct ShellHitMap {
     pub(super) release_notes_scrollbar: Rect,
     pub(super) release_notes_scroll_metrics: Option<crate::pane::ScrollMetrics>,
     pub(super) release_notes_max_scroll: usize,
+    pub(super) tab_bar_files_button: Rect,
+    pub(super) tab_bar_changes_button: Rect,
+    pub(super) right_panel_divider: Rect,
+    pub(super) right_panel_body: Rect,
+    pub(super) right_panel_close: Rect,
+    pub(super) right_panel_refresh: Rect,
+    pub(super) right_panel_max_scroll: usize,
+    pub(super) right_panel_rows: Vec<(Rect, super::right_panel::RightPanelRowHit)>,
 }
 
 #[derive(Clone)]
@@ -198,6 +207,7 @@ pub(super) struct ClientTabPress {
 pub(super) enum ClientChromeDrag {
     SidebarWidth,
     SidebarSection,
+    RightPanelWidth,
     WorkspaceScrollbar {
         grab_row_offset: u16,
     },
@@ -900,6 +910,7 @@ pub(crate) struct ClientShellState {
     pub(super) last_composed_at: Option<std::time::Instant>,
     pub(super) selection_repaint_deadline: Option<std::time::Instant>,
     pub(super) hits: ShellHitMap,
+    pub(crate) right_panel: super::right_panel::RightPanelState,
     pub(super) endpoints: Vec<ClientShellEndpoint>,
     pub(super) active_endpoint_id: ClientEndpointId,
     pub(super) collapsed_endpoints: HashSet<ClientEndpointId>,
@@ -1076,6 +1087,7 @@ impl ClientShellState {
             last_composed_at: None,
             selection_repaint_deadline: None,
             hits: ShellHitMap::default(),
+            right_panel: super::right_panel::RightPanelState::default(),
             endpoints: vec![local_endpoint()],
             active_endpoint_id: ClientEndpointId::Local,
             collapsed_endpoints: HashSet::new(),
@@ -1239,12 +1251,18 @@ impl ClientShellState {
     }
 
     pub(super) fn layout(&self, cols: u16, rows: u16) -> ClientShellLayout {
-        self.config.layout(
+        let right_panel_width = if self.right_panel.active_tab.is_some() {
+            self.right_panel.width
+        } else {
+            0
+        };
+        self.config.layout_with_right_panel(
             cols,
             rows,
             self.sidebar_collapsed,
             self.focused_tab_count(),
             self.sidebar_width,
+            right_panel_width,
         )
     }
 
@@ -1896,6 +1914,10 @@ impl ClientShellState {
             return true;
         }
         false
+    }
+
+    pub(crate) fn tick_right_panel(&mut self) -> bool {
+        self.right_panel.poll()
     }
 
     pub(crate) fn timer_delay(&self, now: std::time::Instant) -> std::time::Duration {

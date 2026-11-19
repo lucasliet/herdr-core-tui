@@ -201,6 +201,9 @@ impl App {
             .workspaces
             .iter()
             .filter_map(|ws| {
+                if crate::hc::client::get_workspace_machine(&ws.id).is_some() {
+                    return None;
+                }
                 let cwd =
                     ws.resolved_identity_cwd_from(&self.state.terminals, &self.terminal_runtimes)?;
                 let cache_key_hint = (!refresh_repo_discovery && ws.cached_identity_cwd == cwd)
